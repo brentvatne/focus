@@ -1,0 +1,25 @@
+{
+  "name": "focus",
+  "version": "0.1.0",
+  "description": "Block distracting websites on macOS by managing a marked section of /etc/hosts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "focus": "src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build --compile src/cli.ts --outfile dist/focus && codesign --sign - --force dist/focus",
+    "build:release": "bun scripts/build-release.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.8.1"
+  }
+}
