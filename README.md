@@ -24,10 +24,12 @@ Set `FOCUS_VERSION=v0.1.0` to install a specific release, or `FOCUS_INSTALL_DIR`
 
 ```bash
 focus upgrade -n        # check for a newer release
-sudo focus upgrade      # replace /usr/local/bin/focus with it
+focus upgrade           # replace /usr/local/bin/focus with it, then sync presets
 ```
 
 `focus upgrade` downloads the latest release and checks its SHA-256 against `SHA256SUMS`. It then runs the new binary's `--version` and swaps it in atomically, keeping the file's mode and owner. If any step fails, the installed binary is left untouched.
+
+After swapping, the new binary runs `focus sync`, so your presets pick up any hostnames the new version added (see [Presets](#presets-focus-init)). Upgrades made with 0.1.0's `upgrade` command, or by re-running `install.sh`, skip this step. In that case `focus status` says a sync is needed; run `focus sync`.
 
 For a private repo, focus finds a token in this order:
 
@@ -49,14 +51,19 @@ The build step re-signs the binary because macOS kills Bun's compiled output (ex
 ## Usage
 
 ```bash
-sudo focus init                         # pick from preset site groups (see below)
-sudo focus add youtube.com reddit.com   # also blocks www.youtube.com and www.reddit.com
-sudo focus add --exact news.ycombinator.com
-sudo focus off                          # stop blocking but keep the list
-sudo focus on                           # start blocking again
-sudo focus remove reddit.com            # also removes www.reddit.com unless --exact
-focus status                            # read-only, so no sudo needed
+focus init                         # choose preset site groups from a checklist (see below)
+focus add --preset instagram       # turn one preset on…
+focus remove --preset instagram    # …or off
+focus add example.com              # also blocks www.example.com
+focus add --exact news.example.com
+focus remove example.com           # also removes www.example.com unless --exact
+focus off                          # stop blocking but keep the list
+focus on                           # start blocking again
+focus sync                         # update presets to this version's hostnames
+focus status                            # read-only
 ```
+
+Commands that change `/etc/hosts` need root, so focus re-runs itself through `sudo` and you get a password prompt. To skip the prompt, see [Running without a password](#running-without-a-password). `status`, `--dry-run` and `version` never ask.
 
 Add `-n` / `--dry-run` to any command to print a unified diff of the hosts file without writing it:
 
@@ -66,7 +73,8 @@ focus add -n twitter.com
 
 | Option | Meaning |
 | --- | --- |
-| `-y`, `--yes` | `init` only: add the recommended presets without prompting |
+| `-y`, `--yes` | `init` only: keep the current presets without prompting (on a fresh install, use the recommended ones) |
+| `--preset` | `add`/`remove` only: the arguments are preset names, not hostnames |
 | `-n`, `--dry-run` | Print the diff and don't write anything |
 | `--exact` / `--no-exact` | Don't (or do) add or remove the `www.` variant. The default comes from the config file, or is `--no-exact`. |
 | `--hosts-file <path>` | Manage a different file. You can also set `FOCUS_HOSTS_FILE`. The default is `/etc/hosts`. |
@@ -74,7 +82,7 @@ focus add -n twitter.com
 
 ## Presets: `focus init`
 
-`focus init` opens a checklist of common distractions, with the recommended presets already checked:
+`focus init` opens a checklist of common distractions. Your current presets start checked; on a fresh install, the recommended ones are. The final selection replaces your presets, so unchecking one turns it off:
 
 ```
 ◆  Which sites should focus block?
@@ -90,7 +98,7 @@ focus add -n twitter.com
 
 | Preset | Recommended | Hostnames |
 | --- | --- | --- |
-| `x` | yes | x.com, www.x.com, mobile.x.com, twitter.com, www.twitter.com, mobile.twitter.com |
+| `x` | yes | x.com, www.x.com, mobile.x.com, api.x.com, twitter.com, www.twitter.com, mobile.twitter.com, api.twitter.com |
 | `facebook` | yes | facebook.com, www.facebook.com, m.facebook.com, web.facebook.com, fb.com, www.fb.com |
 | `youtube` | yes | youtube.com, www.youtube.com, m.youtube.com, youtu.be |
 | `reddit` | yes | reddit.com, www.reddit.com, old.reddit.com, new.reddit.com, m.reddit.com, redd.it |
@@ -102,8 +110,35 @@ focus add -n twitter.com
 
 - **Messenger is separate from Facebook,** so you can block Facebook and still use messenger.com. Shared CDNs such as `fbcdn.net`, `ytimg.com` and `googlevideo.com` are never blocked, which keeps embeds and Messenger's assets loading. `music.youtube.com` also stays reachable.
 - **Presets add exact hostnames.** The `www.` expansion and `exact` don't apply to them.
-- **`init` only adds sites.** Running it again shows presets you've already blocked as disabled. To unblock one, use `focus remove --exact <host...>`.
-- **Without a prompt:** `focus init x youtube` adds the named presets, and `focus init --yes` adds the recommended ones. Use one of these in scripts; `init` with neither stops with an error when there's no terminal.
+- **Presets follow new versions.** focus records which presets you chose (`# preset: <name>` in the hosts file) rather than just copying their hostnames. Whenever it writes the file, it rebuilds each preset from the running version's list. So when a preset gains a hostname, as X did with `api.x.com`, you get it after `focus upgrade` or any other change. Hostnames a preset drops are removed the same way. Sites you added yourself are never touched.
+- **One preset is all or nothing.** `focus remove api.x.com` refuses and points you to `focus remove --preset x`. Adding a hostname that a preset already covers is a no-op.
+- **Without a prompt:** `focus init x youtube` sets your presets to exactly the named ones, and `focus init --yes` keeps the current ones (or picks the recommended ones on a fresh install). Use one of these in scripts; `init` with neither stops with an error when there's no terminal.
+- **Upgrading from 0.1.0:** 0.1.0 didn't record presets. The first time a newer version writes the file, any preset whose 0.1.0 hostnames are all present is recorded as that preset; everything else is kept as your own sites.
+
+## Running without a password
+
+```bash
+focus setup-sudo              # asks for your password one last time
+focus setup-sudo -n           # show the rule without installing it
+focus setup-sudo --remove     # undo
+```
+
+`setup-sudo` installs `/etc/sudoers.d/focus`:
+
+```
+brentvatne ALL=(root) NOPASSWD: /usr/local/bin/focus
+```
+
+After that, focus still gets root through sudo, just without the prompt.
+
+The trade-off: any program running as you can also run focus as root without your password. That means it could run `focus off`. That's fine for a self-control tool, which doesn't defend against you anyway. These safeguards keep the rule from granting more than that:
+
+- **Only the installed binary.** focus refuses to install the rule when running from source, because a rule naming `bun` would grant root for any script.
+- **Only a binary nobody else can change.** The binary and every directory above it must be owned by root and not writable by group or others. `/usr/local/bin/focus` from `install.sh` qualifies. Otherwise, replacing the binary would be a way to become root.
+- **As root, focus only ever writes `/etc/hosts`.** `--hosts-file` and `FOCUS_HOSTS_FILE` are refused unless they point at it, so the rule can't be used to write other root-owned files.
+- **Under sudo, the config file must be yours.** Otherwise a config symlinked to a root-only file could leak bits of that file through error messages.
+- **The rule is checked twice.** It's validated with `visudo -cf` before it's moved into place, so a syntax error can't break sudo. Afterwards, focus confirms with `sudo -l` that sudo picked it up, and removes the rule again if it didn't.
+- **Upgrades keep it working,** because `focus upgrade` replaces the binary at the same path.
 
 ## Configuration
 
@@ -113,7 +148,7 @@ focus reads defaults from a global config file. This is optional; if the file do
 2. `$XDG_CONFIG_HOME/focus/config.json`
 3. `~/.config/focus/config.json`
 
-Under `sudo`, `~` means the home directory of the user who ran sudo (looked up with `dscl`), not `/var/root`. That way `sudo focus` and `focus` read the same file. `focus status` prints the path it used.
+Under `sudo`, `~` means the home directory of the user who ran sudo (looked up with `dscl`), not `/var/root`. That way focus reads the same file whether or not it's running under sudo. `focus status` prints the path it used.
 
 ```json
 {
@@ -131,7 +166,7 @@ Flags always win over the config file. focus rejects unknown keys and non-boolea
 
 Two things are deliberately left out of the config file:
 - **The block list.** It lives only in the hosts file, which keeps one source of truth and keeps undoing simple.
-- **The hosts file path.** The config file is writable by your user but read by a root process. If it could set the path, a bad entry could make `sudo focus` append lines to some other system file, such as `/etc/sudoers`. Use `--hosts-file` or `FOCUS_HOSTS_FILE` instead.
+- **The hosts file path.** The config file is writable by your user but read by a root process. If it could set the path, a bad entry could make focus, running as root, append lines to some other system file, such as `/etc/sudoers`. Use `--hosts-file` or `FOCUS_HOSTS_FILE` instead.
 
 ## How it works
 
@@ -141,14 +176,21 @@ focus owns only the lines between its two markers:
 # BEGIN focus
 # Managed by the focus CLI. To undo by hand, delete every line from BEGIN to END.
 # state: on
+# preset: youtube
 0.0.0.0 youtube.com
 :: youtube.com
+...
+# sites
+0.0.0.0 example.com
+:: example.com
 # END focus
 ```
 
+Presets come first, each under its own `# preset:` header and in catalog order. Hostnames you added with `focus add` come under `# sites`.
+
 - **IPv4 and IPv6:** each hostname points to both `0.0.0.0` and `::`. A site that has an AAAA record can't get through over IPv6.
-- **on/off:** `off` comments out the entries, so the list stays in the file. The hosts file is the only place focus stores state.
-- **Reversible:** when you remove the last site, focus deletes the whole section, and the file is byte-for-byte what it was before. The one exception is a file that had no trailing newline: it gains one.
+- **on/off:** `off` comments out the entries, so the list stays in the file. The hosts file is the only place focus stores state, including which presets you chose.
+- **Reversible:** when you remove the last site and preset, focus deletes the whole section, and the file is byte-for-byte what it was before. The one exception is a file that had no trailing newline: it gains one.
 - **Hostname validation:** focus lowercases hostnames, removes a trailing dot and converts internationalized names to punycode. It rejects URLs (and suggests the hostname), IP addresses, wildcards, single-label names like `localhost`, and local suffixes such as `.local`, `.localhost` and `.arpa`.
 - **Safe writes:** before every write, focus saves the previous file to `/etc/hosts.focus-backup`. It then writes the new contents to a temp file in `/private/etc` with the original mode, owner and group, fsyncs it and renames it into place, so the hosts file is never half-written. If something else changed the file in the meantime, focus aborts and writes nothing. Symlinks are resolved, so `/etc` → `/private/etc` stays a symlink.
 - **Malformed section:** if the section has a missing or duplicate marker, or a line focus didn't write, focus refuses to make any change until you fix it by hand (see below).
@@ -175,7 +217,7 @@ These are deliberately out of scope for v1.
 
 Use these steps if focus is broken or uninstalled, or if it reports a malformed section.
 
-1. **Try the CLI first.** `sudo focus off` stops blocking. Removing every site with `sudo focus remove <host...>` deletes the section completely.
+1. **Try the CLI first.** `focus off` stops blocking. Unchecking everything in `focus init` and removing your own sites with `focus remove <host...>` deletes the section completely. If focus itself is broken, use `sudo /usr/local/bin/focus off`, or carry on below.
 
 2. **Delete the section by hand.** Make a copy first, then delete everything from `# BEGIN focus` to `# END focus`:
 
@@ -205,7 +247,9 @@ Use these steps if focus is broken or uninstalled, or if it reports a malformed 
    sudo chown root:wheel /private/etc/hosts && sudo chmod 644 /private/etc/hosts
    ```
 
-6. **Flush DNS and verify:**
+6. **Remove the sudoers rule,** if you installed one and are uninstalling focus: `sudo rm /etc/sudoers.d/focus`.
+
+7. **Flush DNS and verify:**
 
    ```bash
    sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
@@ -231,6 +275,7 @@ The tests always set `FOCUS_HOSTS_FILE` and `FOCUS_CONFIG` to files in a fresh t
 - `hostsfile.ts`: reading and writing the file safely
 - `presets.ts` and `prompt.ts`: the `init` presets and checklist
 - `upgrade.ts` and `version.ts`: self-update
+- `sudo.ts`: the `setup-sudo` rule and its safety checks
 - `cli.ts`: commands
 
 ### Releasing
@@ -242,4 +287,4 @@ The tests always set `FOCUS_HOSTS_FILE` and `FOCUS_CONFIG` to files in a fresh t
    git tag v0.2.0 && git push origin v0.2.0
    ```
 
-The Release workflow runs the tests and checks that the tag matches `package.json`. It then builds and signs `focus-darwin-arm64` (`bun run build:release`) and publishes it with `SHA256SUMS` and `install.sh` as a GitHub release. Installed copies pick it up with `sudo focus upgrade`.
+The Release workflow runs the tests and checks that the tag matches `package.json`. It then builds and signs `focus-darwin-arm64` (`bun run build:release`) and publishes it with `SHA256SUMS` and `install.sh` as a GitHub release. Installed copies pick it up with `focus upgrade`.

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { HostsFormatError, readSection, renderSection, writeSection } from "../src/hosts.ts";
+import { type FocusSection, HostsFormatError, readSection, renderSection, writeSection } from "../src/hosts.ts";
 
 const MAC_DEFAULT = `##
 # Host Database
@@ -12,8 +12,9 @@ const MAC_DEFAULT = `##
 ::1             localhost
 `;
 
-const on = (...hosts: string[]) => ({ state: "on" as const, hosts });
-const off = (...hosts: string[]) => ({ state: "off" as const, hosts });
+const on = (...sites: string[]): FocusSection => ({ state: "on", presets: [], sites });
+const off = (...sites: string[]): FocusSection => ({ state: "off", presets: [], sites });
+const parsed = (section: FocusSection, legacy = false) => ({ ...section, legacy });
 
 describe("readSection", () => {
   test("returns null when there is no focus section", () => {
@@ -22,13 +23,42 @@ describe("readSection", () => {
   });
 
   test("round-trips what writeSection wrote", () => {
-    expect(readSection(writeSection(MAC_DEFAULT, on("a.com", "www.a.com")))).toEqual(on("a.com", "www.a.com"));
-    expect(readSection(writeSection(MAC_DEFAULT, off("a.com")))).toEqual(off("a.com"));
+    const grouped: FocusSection = {
+      state: "on",
+      presets: [{ id: "x", hosts: ["x.com", "twitter.com"] }],
+      sites: ["a.com", "www.a.com"],
+    };
+    expect(readSection(writeSection(MAC_DEFAULT, grouped))).toEqual(parsed(grouped));
+    expect(readSection(writeSection(MAC_DEFAULT, off("a.com")))).toEqual(parsed(off("a.com")));
+  });
+
+  test("reads a 0.1.0 section, which has no group headers, as legacy sites", () => {
+    const content = "# BEGIN focus\n# state: on\n0.0.0.0 a.com\n:: a.com\n# END focus\n";
+    expect(readSection(content)).toEqual(parsed(on("a.com"), true));
   });
 
   test("infers state from entries when the state line is missing", () => {
-    expect(readSection("# BEGIN focus\n0.0.0.0 a.com\n# END focus\n")).toEqual(on("a.com"));
-    expect(readSection("# BEGIN focus\n# 0.0.0.0 a.com\n# END focus\n")).toEqual(off("a.com"));
+    expect(readSection("# BEGIN focus\n0.0.0.0 a.com\n# END focus\n")).toEqual(parsed(on("a.com"), true));
+    expect(readSection("# BEGIN focus\n# 0.0.0.0 a.com\n# END focus\n")).toEqual(parsed(off("a.com"), true));
+  });
+
+  test("merges repeated groups and keeps each host in the first group it appears in", () => {
+    const content = [
+      "# BEGIN focus",
+      "# state: on",
+      "# preset: x",
+      "0.0.0.0 x.com",
+      "# sites",
+      "0.0.0.0 x.com",
+      "0.0.0.0 a.com",
+      "# preset: x",
+      "0.0.0.0 twitter.com",
+      "# END focus",
+      "",
+    ].join("\n");
+    expect(readSection(content)).toEqual(
+      parsed({ state: "on", presets: [{ id: "x", hosts: ["x.com", "twitter.com"] }], sites: ["a.com"] }),
+    );
   });
 
   test.each([
@@ -38,25 +68,36 @@ describe("readSection", () => {
     ["two sections", "# BEGIN focus\n# END focus\n# BEGIN focus\n# END focus\n"],
     ["a foreign entry inside", "# BEGIN focus\n127.0.0.1 a.com\n# END focus\n"],
     ["an invalid hostname inside", "# BEGIN focus\n0.0.0.0 localhost\n# END focus\n"],
+    ["an invalid preset name", "# BEGIN focus\n# preset: X Twitter!\n# END focus\n"],
   ])("rejects %s", (_, content) => {
     expect(() => readSection(content)).toThrow(HostsFormatError);
   });
 });
 
 describe("renderSection", () => {
-  test("blocks each host over IPv4 and IPv6", () => {
-    expect(renderSection(on("a.com"))).toEqual([
+  test("groups presets before sites and blocks each host over IPv4 and IPv6", () => {
+    const section: FocusSection = { state: "on", presets: [{ id: "x", hosts: ["x.com"] }], sites: ["a.com"] };
+    expect(renderSection(section)).toEqual([
       "# BEGIN focus",
       "# Managed by the focus CLI. To undo by hand, delete every line from BEGIN to END.",
       "# state: on",
+      "# preset: x",
+      "0.0.0.0 x.com",
+      ":: x.com",
+      "# sites",
       "0.0.0.0 a.com",
       ":: a.com",
       "# END focus",
     ]);
   });
 
+  test("leaves out the sites header when there are none", () => {
+    const section: FocusSection = { state: "on", presets: [{ id: "x", hosts: ["x.com"] }], sites: [] };
+    expect(renderSection(section)).not.toContain("# sites");
+  });
+
   test("comments entries out when off", () => {
-    expect(renderSection(off("a.com")).slice(2, 5)).toEqual(["# state: off", "# 0.0.0.0 a.com", "# :: a.com"]);
+    expect(renderSection(off("a.com")).slice(2, 6)).toEqual(["# state: off", "# sites", "# 0.0.0.0 a.com", "# :: a.com"]);
   });
 });
 
@@ -67,11 +108,12 @@ describe("writeSection", () => {
     expect(updated.slice(MAC_DEFAULT.length)).toBe(renderSection(on("a.com")).join("\n") + "\n");
   });
 
-  test("removing every host restores the original file exactly", () => {
+  test("removing everything restores the original file exactly", () => {
     let content = writeSection(MAC_DEFAULT, on("a.com", "b.com"));
     content = writeSection(content, off("a.com", "b.com"));
-    content = writeSection(content, on("a.com"));
+    content = writeSection(content, { state: "on", presets: [{ id: "x", hosts: ["x.com"] }], sites: ["a.com"] });
     expect(writeSection(content, on())).toBe(MAC_DEFAULT);
+    expect(writeSection(content, { state: "on", presets: [{ id: "x", hosts: [] }], sites: [] })).toBe(MAC_DEFAULT);
     expect(writeSection(content, null)).toBe(MAC_DEFAULT);
   });
 
@@ -85,7 +127,7 @@ describe("writeSection", () => {
     const updated = writeSection(content, on("b.com"));
     expect(updated.startsWith(MAC_DEFAULT)).toBe(true);
     expect(updated.endsWith("# END focus\n10.0.0.5 nas.home.arpa\n")).toBe(true);
-    expect(readSection(updated)).toEqual(on("b.com"));
+    expect(readSection(updated)).toEqual(parsed(on("b.com")));
     expect(writeSection(updated, null)).toBe(`${MAC_DEFAULT}10.0.0.5 nas.home.arpa\n`);
   });
 
@@ -97,7 +139,7 @@ describe("writeSection", () => {
 
   test("handles an empty file", () => {
     const updated = writeSection("", on("a.com"));
-    expect(readSection(updated)).toEqual(on("a.com"));
+    expect(readSection(updated)).toEqual(parsed(on("a.com")));
     expect(writeSection(updated, null)).toBe("");
   });
 

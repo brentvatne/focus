@@ -57,4 +57,5 @@ case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) echo "Note: $INSTALL_DIR is not on your PATH." ;;
 esac
-echo "Get started with: sudo focus init"
+echo "Get started with: focus init"
+echo "Optional: run \`focus setup-sudo\` once so focus can change /etc/hosts without asking for your password."

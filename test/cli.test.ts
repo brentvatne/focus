@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmod, lstat, mkdtemp, readdir, realpath, rm, stat, symlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Io, run } from "../src/cli.ts";
@@ -44,6 +44,27 @@ async function focusWith(overrides: Partial<Io>, ...argv: string[]) {
     flushDns: async () => void flushes++,
     upgrade: async () => {
       throw new Error("tests must stub upgrade; it would reach GitHub");
+    },
+    runBinary: async () => {
+      throw new Error("tests must stub runBinary");
+    },
+    isRoot: false,
+    // A path that doesn't exist, so nothing can fall through to the real /etc/hosts.
+    systemHostsFile: join(dir, "system-hosts"),
+    elevate: async () => {
+      throw new Error("tests must stub elevate; it would run sudo");
+    },
+    binaryPath: null,
+    sudoers: {
+      path: join(dir, "sudoers-focus"),
+      owner: { mode: 0o440, uid: process.getuid!(), gid: process.getgid!() },
+      trustedUid: process.getuid!(),
+      validate: async () => {
+        throw new Error("tests must stub sudoers.validate");
+      },
+      verify: async () => {
+        throw new Error("tests must stub sudoers.verify");
+      },
     },
     ...overrides,
   };
@@ -149,13 +170,13 @@ describe("on / off / status", () => {
   test("on with nothing listed changes nothing", async () => {
     const result = await focus("on");
     expect(result.code).toBe(0);
-    expect(result.stderr).toContain("no sites are listed");
+    expect(result.stderr).toContain("nothing is listed yet");
     expect(await read()).toBe(ORIGINAL);
   });
 
   test("status reports when nothing is set up", async () => {
     expect((await focus("status")).stdout).toBe(
-      `Hosts file: ${hostsFile}\nBlocking:   off (no sites listed)\n` +
+      `Hosts file: ${hostsFile}\nBlocking:   off (nothing listed)\n` +
         `Config:     ${configFile} (not found; using defaults)\n`,
     );
   });
@@ -166,7 +187,7 @@ describe("--dry-run", () => {
     const before = await stat(hostsFile);
     const result = await focus("add", "--dry-run", "a.com");
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain(`--- ${hostsFile}\n+++ ${hostsFile} (after focus add)\n@@ -4,3 +4,11 @@`);
+    expect(result.stdout).toContain(`--- ${hostsFile}\n+++ ${hostsFile} (after focus add)\n@@ -4,3 +4,12 @@`);
     expect(result.stdout).toContain("+0.0.0.0 a.com\n+:: a.com\n");
     expect(result.stdout).toContain("Dry run:");
     expect(await read()).toBe(ORIGINAL);
@@ -178,7 +199,9 @@ describe("--dry-run", () => {
   test("-n works for off", async () => {
     await focus("add", "--exact", "a.com");
     const result = await focus("-n", "off");
-    expect(result.stdout).toContain("-# state: on\n-0.0.0.0 a.com\n-:: a.com\n+# state: off\n+# 0.0.0.0 a.com\n+# :: a.com\n");
+    expect(result.stdout).toContain(
+      "-# state: on\n+# state: off\n # sites\n-0.0.0.0 a.com\n-:: a.com\n+# 0.0.0.0 a.com\n+# :: a.com\n",
+    );
     expect((await focus("status")).stdout).toContain("Blocking:   on");
   });
 });
@@ -243,54 +266,64 @@ describe("file handling", () => {
 });
 
 describe("init", () => {
-  const RECOMMENDED = ["x.com", "twitter.com", "facebook.com", "www.youtube.com", "youtu.be", "old.reddit.com"];
+  const presetsLine = async () => (await focus("status")).stdout.split("\n").find((line) => line.startsWith("Presets:"));
 
-  test("--yes adds the recommended presets, but not Messenger", async () => {
-    const result = await focus("init", "--yes");
-    expect(result.code).toBe(0);
-    const { stdout } = await focus("status");
-    for (const host of RECOMMENDED) expect(stdout).toContain(`  ${host}\n`);
-    expect(stdout).not.toContain("messenger.com");
-    expect(stdout).not.toContain("instagram.com");
+  test("--yes turns on the recommended presets, but not Messenger", async () => {
+    expect((await focus("init", "--yes")).code).toBe(0);
+    expect(await presetsLine()).toBe("Presets:    X / Twitter, Facebook, YouTube, Reddit");
+    const content = await read();
+    for (const host of ["api.x.com", "facebook.com", "youtu.be", "old.reddit.com"]) {
+      expect(content).toContain(`0.0.0.0 ${host}\n`);
+    }
+    expect(content).not.toContain("messenger.com");
   });
 
-  test("adds preset hosts exactly, ignoring the www expansion", async () => {
+  test("writes each preset under its own header, without the www expansion", async () => {
     await focus("init", "youtube");
-    expect((await focus("status")).stdout).toContain(
-      "Sites (4):\n  youtube.com\n  www.youtube.com\n  m.youtube.com\n  youtu.be\n",
+    expect(await read()).toContain(
+      "# preset: youtube\n" +
+        ["youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"].map((h) => `0.0.0.0 ${h}\n:: ${h}\n`).join(""),
     );
   });
 
-  test("named presets skip the prompt", async () => {
+  test("named presets replace the current ones and skip the prompt", async () => {
+    await focus("init", "--yes");
     let prompted = false;
     const selectPresets = async () => ((prompted = true), []);
     expect((await focusWith({ selectPresets }, "init", "messenger", "Reddit")).code).toBe(0);
     expect(prompted).toBe(false);
-    const { stdout } = await focus("status");
-    expect(stdout).toContain("  www.messenger.com\n");
-    expect(stdout).toContain("  redd.it\n");
-    expect(stdout).not.toContain("facebook.com");
+    expect(await presetsLine()).toBe("Presets:    Reddit, Messenger");
+    expect(await read()).not.toContain("facebook.com");
   });
 
-  test("prompts with what's already listed and adds the chosen presets", async () => {
+  test("the checklist starts from the current presets, and unchecking one removes it", async () => {
+    await focus("init", "x", "youtube");
     await focus("add", "a.com");
-    let seen: string[] = [];
-    const selectPresets = async (_: unknown, listed: string[]) => ((seen = listed), ["hackernews"]);
+    let initial: string[] = [];
+    const selectPresets = async (_: unknown, current: string[]) => ((initial = current), ["youtube", "hackernews"]);
     expect((await focusWith({ selectPresets }, "init")).code).toBe(0);
-    expect(seen).toEqual(["a.com", "www.a.com"]);
-    expect((await focus("status")).stdout).toContain("Sites (3):\n  a.com\n  www.a.com\n  news.ycombinator.com\n");
+    expect(initial).toEqual(["x", "youtube"]);
+    expect(await presetsLine()).toBe("Presets:    YouTube, Hacker News");
+    expect(await read()).not.toContain("x.com");
+    expect((await focus("status")).stdout).toContain("Sites (2):\n  a.com\n  www.a.com\n");
+  });
+
+  test("the checklist starts from the recommended presets on a fresh install", async () => {
+    let initial: string[] = [];
+    await focusWith({ selectPresets: async (_: unknown, current: string[]) => ((initial = current), null) }, "init");
+    expect(initial).toEqual(["x", "facebook", "youtube", "reddit"]);
+  });
+
+  test("unchecking every preset restores the original file", async () => {
+    await focus("init", "--yes");
+    expect((await focusWith({ selectPresets: async () => [] }, "init")).code).toBe(0);
+    expect(await read()).toBe(ORIGINAL);
   });
 
   test("cancelling the prompt changes nothing", async () => {
     const result = await focusWith({ selectPresets: async () => null }, "init");
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("Cancelled");
-    expect(await read()).toBe(ORIGINAL);
-  });
-
-  test("selecting nothing changes nothing", async () => {
-    const result = await focusWith({ selectPresets: async () => [] }, "init");
-    expect(result.stdout).toContain("No changes");
     expect(await read()).toBe(ORIGINAL);
   });
 
@@ -308,8 +341,8 @@ describe("init", () => {
     expect(await read()).toBe(ORIGINAL);
   });
 
-  test("running it again is a no-op", async () => {
-    await focus("init", "--yes");
+  test("--yes keeps the current presets", async () => {
+    await focus("init", "hackernews");
     const before = await read();
     const result = await focus("init", "--yes");
     expect(result.stdout).toContain("No changes");
@@ -324,6 +357,88 @@ describe("init", () => {
   });
 });
 
+describe("presets with add and remove", () => {
+  test("add --preset and remove --preset toggle single presets", async () => {
+    await focus("add", "a.com");
+    expect((await focus("add", "--preset", "instagram", "x")).code).toBe(0);
+    expect((await focus("status")).stdout).toContain("Presets:    X / Twitter, Instagram\n");
+    expect((await focus("remove", "--preset", "x")).code).toBe(0);
+    expect((await focus("status")).stdout).toContain("Presets:    Instagram\nSites (2):");
+    const result = await focus("rm", "--preset", "x");
+    expect(result.stderr).toContain("the x preset isn't on");
+  });
+
+  test("won't remove one host of a preset and says how to remove the preset", async () => {
+    await focus("init", "x");
+    const before = await read();
+    const result = await focus("remove", "api.x.com");
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain("api.x.com is blocked by the X / Twitter preset");
+    expect(result.stderr).toContain("focus remove --preset x");
+    expect(await read()).toBe(before);
+  });
+
+  test("adding a host a preset already blocks is a no-op", async () => {
+    await focus("init", "youtube");
+    const result = await focus("add", "youtube.com");
+    expect(result.stderr).toContain("youtube.com is already blocked by the YouTube preset");
+    expect(result.stdout).toContain("No changes");
+  });
+
+  test("--preset only works with add and remove", async () => {
+    expect((await focus("on", "--preset")).code).toBe(2);
+  });
+});
+
+describe("sync", () => {
+  // What `focus init --yes` wrote with 0.1.0, followed by a site added by hand.
+  const V0_1_0_SECTION = [
+    "# BEGIN focus",
+    "# Managed by the focus CLI. To undo by hand, delete every line from BEGIN to END.",
+    "# state: on",
+    ...["x.com", "www.x.com", "mobile.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"].flatMap((h) => [
+      `0.0.0.0 ${h}`,
+      `:: ${h}`,
+    ]),
+    ...["youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"].flatMap((h) => [`0.0.0.0 ${h}`, `:: ${h}`]),
+    "0.0.0.0 a.com",
+    ":: a.com",
+    "# END focus",
+    "",
+  ].join("\n");
+
+  test("converts a 0.1.0 section to presets and adds their new hosts", async () => {
+    await Bun.write(hostsFile, ORIGINAL + V0_1_0_SECTION);
+    const stale = await focus("status");
+    expect(stale.stdout).toContain("Presets:    X / Twitter, YouTube\n");
+    expect(stale.stdout).toContain("Sync:       needed");
+
+    const result = await focus("sync");
+    expect(result.code).toBe(0);
+    const content = await read();
+    expect(content).toContain("# preset: x\n");
+    expect(content).toContain("0.0.0.0 api.x.com\n:: api.x.com\n0.0.0.0 twitter.com\n");
+    expect(content).toContain("# sites\n0.0.0.0 a.com\n:: a.com\n# END focus\n");
+    expect(content.startsWith(ORIGINAL)).toBe(true);
+    expect((await focus("status")).stdout).not.toContain("Sync:");
+    expect((await focus("sync")).stdout).toContain("No changes");
+  });
+
+  test("any write also syncs", async () => {
+    await Bun.write(hostsFile, ORIGINAL + V0_1_0_SECTION);
+    await focus("add", "b.com");
+    expect(await read()).toContain("0.0.0.0 api.twitter.com\n");
+  });
+
+  test("keeps blocking off while syncing", async () => {
+    await Bun.write(hostsFile, ORIGINAL + V0_1_0_SECTION);
+    await focus("off");
+    await focus("sync");
+    expect(await read()).toContain("# 0.0.0.0 api.x.com\n");
+    expect((await focus("status")).stdout).toContain("Blocking:   off");
+  });
+});
+
 describe("version and upgrade", () => {
   test.each([["--version"], ["-v"], ["version"]])("%s prints the version", async (arg) => {
     const result = await focus(arg);
@@ -334,11 +449,39 @@ describe("version and upgrade", () => {
   test.each([
     [{ status: "up-to-date", current: "0.1.0" }, "focus 0.1.0 is up to date.\n"],
     [{ status: "available", current: "0.1.0", latest: "0.2.0" }, "focus 0.2.0 is available (you have 0.1.0)"],
-    [{ status: "upgraded", current: "0.1.0", latest: "0.2.0", path: "/usr/local/bin/focus" }, "0.1.0 -> 0.2.0"],
-  ] as const)("reports %o", async (outcome, message) => {
+  ] as const)("reports %o without syncing", async (outcome, message) => {
     const result = await focusWith({ upgrade: async () => outcome }, "upgrade");
     expect(result.code).toBe(0);
     expect(result.stdout).toContain(message);
+  });
+
+  const upgraded = async () => ({
+    status: "upgraded" as const,
+    current: "0.1.0",
+    latest: "0.2.0",
+    path: "/usr/local/bin/focus",
+  });
+
+  test("has the new binary sync presets after upgrading", async () => {
+    const calls: [string, string[]][] = [];
+    const runBinary = async (path: string, args: string[]) => (calls.push([path, args]), 0);
+    const result = await focusWith({ upgrade: upgraded, runBinary }, "upgrade");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("Upgraded focus 0.1.0 -> 0.2.0");
+    expect(calls).toEqual([["/usr/local/bin/focus", ["sync"]]]);
+  });
+
+  test("passes --hosts-file and --no-flush on to the sync", async () => {
+    const calls: string[][] = [];
+    const runBinary = async (_: string, args: string[]) => (calls.push(args), 0);
+    await focusWith({ upgrade: upgraded, runBinary }, "upgrade", "--hosts-file", "/tmp/h", "--no-flush");
+    expect(calls).toEqual([["sync", "--hosts-file", "/tmp/h", "--no-flush"]]);
+  });
+
+  test("fails if the sync after upgrading fails", async () => {
+    const result = await focusWith({ upgrade: upgraded, runBinary: async () => 1 }, "upgrade");
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("run `focus sync`");
   });
 
   test("--dry-run only checks", async () => {
@@ -362,6 +505,206 @@ describe("version and upgrade", () => {
     const result = await focusWith({ upgrade }, "upgrade");
     expect(result.code).toBe(1);
     expect(result.stderr).toBe("focus: checksum mismatch for focus-darwin-arm64; nothing was replaced\n");
+  });
+});
+
+describe("running without typing sudo", () => {
+  // These tests treat the temp hosts file as the system one.
+  const asSystem = (overrides: Partial<Io> = {}) => ({
+    systemHostsFile: hostsFile,
+    env: { FOCUS_CONFIG: configFile },
+    ...overrides,
+  });
+
+  test("asks sudo to rerun commands that change the system hosts file", async () => {
+    const calls: string[][] = [];
+    const elevate = async (argv: string[]) => (calls.push(argv), 0);
+    const result = await focusWith(asSystem({ elevate }), "add", "--exact", "a.com");
+    expect(result.code).toBe(0);
+    expect(calls).toEqual([["add", "--exact", "a.com"]]);
+    expect(result.stderr).toContain("Run `focus setup-sudo` once to skip the password");
+    expect(await read()).toBe(ORIGINAL);
+  });
+
+  test("passes sudo's exit code through", async () => {
+    expect((await focusWith(asSystem({ elevate: async () => 1 }), "off")).code).toBe(1);
+  });
+
+  test("skips the hint once the sudoers rule is installed", async () => {
+    await Bun.write(join(dir, "sudoers-focus"), "rule");
+    const result = await focusWith(asSystem({ elevate: async () => 0 }), "on");
+    expect(result.stderr).toBe("");
+  });
+
+  test("doesn't need root for status or dry runs", async () => {
+    expect((await focusWith(asSystem(), "status")).code).toBe(0);
+    const dry = await focusWith(asSystem(), "add", "-n", "a.com");
+    expect(dry.code).toBe(0);
+    expect(dry.stdout).toContain("+0.0.0.0 a.com");
+  });
+
+  test("never elevates for other hosts files", async () => {
+    expect((await focus("add", "a.com")).code).toBe(0);
+  });
+
+  test("as root, writes the system hosts file directly and flushes DNS", async () => {
+    const result = await focusWith(asSystem({ isRoot: true }), "add", "a.com");
+    expect(result.code).toBe(0);
+    expect(result.flushes).toBe(1);
+    expect(await read()).toContain("0.0.0.0 a.com\n");
+  });
+
+  test("as root, refuses any other hosts file", async () => {
+    const result = await focusWith({ isRoot: true }, "add", "a.com");
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("as root, focus only manages");
+    expect(await read()).toBe(ORIGINAL);
+  });
+
+  test("as root, --hosts-file is fine when it is the system hosts file", async () => {
+    expect((await focusWith(asSystem({ isRoot: true }), "--hosts-file", hostsFile, "add", "a.com")).code).toBe(0);
+  });
+
+  test("under sudo, only reads a config file the invoking user owns", async () => {
+    await Bun.write(configFile, JSON.stringify({ exact: true }));
+    const env = (uid: number) => ({ FOCUS_CONFIG: configFile, SUDO_UID: String(uid) });
+    const stranger = await focusWith(asSystem({ isRoot: true, env: env(process.getuid!() + 1) }), "add", "a.com");
+    expect(stranger.code).toBe(1);
+    expect(stranger.stderr).toContain("must be owned by you");
+    expect(await read()).toBe(ORIGINAL);
+
+    expect((await focusWith(asSystem({ isRoot: true, env: env(process.getuid!()) }), "add", "a.com")).code).toBe(0);
+    expect(await read()).not.toContain("www.a.com");
+  });
+
+  describe("upgrade", () => {
+    const available = async () => ({ status: "available" as const, current: "0.1.0", latest: "0.2.0" });
+
+    test("asks sudo only once a newer release exists and the binary isn't writable", async () => {
+      await mkdir(join(dir, "bin"));
+      await Bun.write(join(dir, "bin", "focus"), "binary");
+      await chmod(join(dir, "bin"), 0o555);
+      try {
+        const seen: boolean[] = [];
+        const calls: string[][] = [];
+        const binaryPath = join(dir, "bin", "focus");
+        const upgrade = async (dryRun: boolean) => (seen.push(dryRun), available());
+        const elevate = async (argv: string[]) => (calls.push(argv), 0);
+        expect((await focusWith({ binaryPath, upgrade, elevate }, "upgrade")).code).toBe(0);
+        expect(seen).toEqual([true]);
+        expect(calls).toEqual([["upgrade"]]);
+
+        const upToDate = async () => ({ status: "up-to-date" as const, current: "0.2.0" });
+        const result = await focusWith({ binaryPath, upgrade: upToDate }, "upgrade");
+        expect(result.stdout).toBe("focus 0.2.0 is up to date.\n");
+      } finally {
+        await chmod(join(dir, "bin"), 0o755);
+      }
+    });
+
+    test("doesn't ask when the binary's directory is writable", async () => {
+      await Bun.write(join(dir, "focus-binary"), "binary");
+      const seen: boolean[] = [];
+      const upgrade = async (dryRun: boolean) => (seen.push(dryRun), { status: "up-to-date" as const, current: "0.1.0" });
+      await focusWith({ binaryPath: join(dir, "focus-binary"), upgrade }, "upgrade");
+      expect(seen).toEqual([false]);
+    });
+  });
+});
+
+describe("setup-sudo", () => {
+  let binary: string;
+  beforeEach(async () => {
+    await mkdir(join(dir, "bin"));
+    binary = join(dir, "bin", "focus");
+    await Bun.write(binary, "binary");
+    await chmod(binary, 0o755);
+  });
+
+  const asRoot = (overrides: Partial<Io["sudoers"]> = {}): Partial<Io> => ({
+    isRoot: true,
+    binaryPath: binary,
+    env: { FOCUS_CONFIG: configFile, SUDO_USER: "brent" },
+    sudoers: {
+      path: join(dir, "sudoers-focus"),
+      owner: { mode: 0o440, uid: process.getuid!(), gid: process.getgid!() },
+      trustedUid: process.getuid!(),
+      validate: async () => {},
+      verify: async () => true,
+      ...overrides,
+    },
+  });
+
+  test("installs a validated, read-only rule for the invoking user and this binary", async () => {
+    const validated: string[] = [];
+    const validate = async (path: string) => void validated.push(await Bun.file(path).text());
+    const result = await focusWith(asRoot({ validate }), "setup-sudo");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("brent can now run focus without sudo or a password");
+    const rule = await Bun.file(join(dir, "sudoers-focus")).text();
+    expect(rule).toContain(`\nbrent ALL=(root) NOPASSWD: ${binary}\n`);
+    expect(validated).toEqual([rule]);
+    expect((await stat(join(dir, "sudoers-focus"))).mode & 0o7777).toBe(0o440);
+  });
+
+  test("asks sudo to rerun it when not root", async () => {
+    const calls: string[][] = [];
+    const elevate = async (argv: string[]) => (calls.push(argv), 0);
+    expect((await focusWith({ binaryPath: binary, elevate }, "setup-sudo")).code).toBe(0);
+    expect(calls).toEqual([["setup-sudo"]]);
+  });
+
+  test("--dry-run shows the rule without root", async () => {
+    const result = await focusWith({ binaryPath: binary, env: { USER: "brent" } }, "setup-sudo", "-n");
+    expect(result.stdout).toContain(`brent ALL=(root) NOPASSWD: ${binary}`);
+    expect(await Bun.file(join(dir, "sudoers-focus")).exists()).toBe(false);
+  });
+
+  test("leaves nothing behind when visudo rejects the rule", async () => {
+    const validate = async () => {
+      throw new Error("syntax error");
+    };
+    expect((await focusWith(asRoot({ validate }), "setup-sudo")).code).toBe(1);
+    expect((await readdir(dir)).filter((name) => name.includes("sudoers"))).toEqual([]);
+  });
+
+  test("removes the rule again when sudo doesn't pick it up", async () => {
+    const result = await focusWith(asRoot({ verify: async () => false }), "setup-sudo");
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("sudo didn't pick up");
+    expect(await Bun.file(join(dir, "sudoers-focus")).exists()).toBe(false);
+  });
+
+  test("refuses a binary others could modify", async () => {
+    await chmod(binary, 0o775);
+    const result = await focusWith(asRoot(), "setup-sudo");
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("must be owned by root and not writable by group or others");
+    expect(await Bun.file(join(dir, "sudoers-focus")).exists()).toBe(false);
+  });
+
+  test("refuses to run from source", async () => {
+    const result = await focusWith({ ...asRoot(), binaryPath: null }, "setup-sudo");
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("only works with the installed focus binary");
+  });
+
+  test("refuses without a sudo user", async () => {
+    const result = await focusWith({ ...asRoot(), env: { FOCUS_CONFIG: configFile } }, "setup-sudo");
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("as your own user");
+  });
+
+  test("--remove deletes the rule", async () => {
+    await focusWith(asRoot(), "setup-sudo");
+    const removed = await focusWith(asRoot(), "setup-sudo", "--remove");
+    expect(removed.stdout).toContain("Removed");
+    expect(await Bun.file(join(dir, "sudoers-focus")).exists()).toBe(false);
+    expect((await focusWith(asRoot(), "setup-sudo", "--remove")).stdout).toContain("No sudoers rule was installed");
+  });
+
+  test("--remove only works with setup-sudo", async () => {
+    expect((await focus("off", "--remove")).code).toBe(2);
   });
 });
 

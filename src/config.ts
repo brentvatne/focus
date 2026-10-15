@@ -1,3 +1,4 @@
+import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -41,13 +42,31 @@ export async function resolveConfigPath(
   return join(home, ".config", "focus", "config.json");
 }
 
-export async function loadConfig(path: string): Promise<LoadedConfig> {
-  const file = Bun.file(path);
-  if (!(await file.exists())) return { path, found: false, config: { ...DEFAULT_CONFIG } };
+/**
+ * Reads the config file. Under sudo, pass the invoking user's uid as `requiredOwner`:
+ * the file must then be theirs, so root never reads (and echoes parts of, in error
+ * messages) a file they couldn't read themselves, such as a symlink to /etc/master.passwd.
+ */
+export async function loadConfig(path: string, requiredOwner?: number): Promise<LoadedConfig> {
+  let text: string;
+  try {
+    const handle = await open(path, "r");
+    try {
+      if (requiredOwner !== undefined && (await handle.stat()).uid !== requiredOwner) {
+        throw new ConfigError(`${path}: must be owned by you to be read under sudo`);
+      }
+      text = await handle.readFile("utf8");
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, found: false, config: { ...DEFAULT_CONFIG } };
+    throw error;
+  }
 
   let raw: unknown;
   try {
-    raw = JSON.parse(await file.text());
+    raw = JSON.parse(text);
   } catch (error) {
     throw new ConfigError(`${path}: invalid JSON (${(error as Error).message})`);
   }
