@@ -1,8 +1,7 @@
 #!/bin/sh
 # Installs the latest focus release to /usr/local/bin.
 #
-# Public repo:   curl -fsSL https://raw.githubusercontent.com/brentvatne/focus/main/install.sh | sh
-# Private repo:  gh release download -R brentvatne/focus -p install.sh -O - | sh
+#   curl -fsSL https://raw.githubusercontent.com/brentvatne/focus/main/install.sh | sh
 #
 # FOCUS_VERSION=v0.1.0 installs a specific release; FOCUS_INSTALL_DIR changes the destination.
 set -eu
@@ -24,7 +23,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-  # gh is authenticated, which also works while the repo is private.
+  # gh is authenticated, which also works for a private fork.
   if [ -n "$VERSION" ]; then
     gh release download "$VERSION" -R "$REPO" -p "$ASSET" -p SHA256SUMS -D "$TMP"
   else
@@ -37,7 +36,7 @@ else
     BASE="https://github.com/$REPO/releases/latest/download"
   fi
   curl -fsSL -o "$TMP/$ASSET" "$BASE/$ASSET" -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" ||
-    fail "download failed. While the repo is private, install the GitHub CLI and run \`gh auth login\` first."
+    fail "download failed. Check your connection, or install the GitHub CLI and run \`gh auth login\` first."
 fi
 
 (cd "$TMP" && shasum -a 256 -c SHA256SUMS >/dev/null) || fail "checksum mismatch; nothing was installed"

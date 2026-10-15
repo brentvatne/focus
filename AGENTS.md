@@ -1,12 +1,12 @@
 # AGENTS.md
 
-This file covers what you need to know to work on focus. `README.md` is the user-facing documentation: usage, presets, config, manual recovery and the release process. Read both.
+This file covers what you need to know to work on focus. User documentation is split in two. `README.md` is a deliberately minimal intro: install, the main commands, two screenshots and the essential recovery command. `docs/guide.md` is the full reference: presets, config, running without a password, how it works, manual recovery, development and releasing. Read the guide before changing behaviour, and keep the README short.
 
 ## What this is
 
 focus is a macOS CLI written in Bun and TypeScript. It blocks websites by managing one marked section of `/etc/hosts`.
 - **Commands:** `init`, `add`, `remove`/`rm` (both also take `--preset`), `on`, `off`, `status`, `sync`, `upgrade`/`self-update`, `setup-sudo` and `version`.
-- **Distribution:** a self-contained, ad-hoc-signed arm64 binary, published as GitHub releases from the private repo `brentvatne/focus`.
+- **Distribution:** a self-contained, ad-hoc-signed arm64 binary, published as GitHub releases from the public repo `brentvatne/focus`.
 - **v1 scope:** v1 must stay reversible. It deliberately has no timers, daemons, schedules or anti-tampering features. Don't add these unless asked.
 
 ## Commands
@@ -35,7 +35,7 @@ Use Bun, not Node: run with `bun`, test with `bun:test`, use `Bun.file`/`Bun.wri
    Keep all of these. A test that drops one could reach `/etc/hosts`, your real `~/.config/focus/config.json`, GitHub or sudo. Tests that exercise root behaviour point `systemHostsFile` at the temp hosts file instead of the real one.
 3. **Never run real sudo from an agent session.** That includes the elevation path, because a cached sudo login would let it rewrite the real `/etc/hosts`. If you must check that the elevation path is wired up, first confirm `/usr/bin/sudo -n true` fails, then run with stdin redirected from `/dev/null`, so sudo refuses before anything runs as root.
 4. **Lines outside the managed section are sacred.** Unrelated content must stay byte-for-byte identical, including CRLF line endings and a missing final newline. Removing the last site must restore the original file exactly. `test/hosts.test.ts` asserts all of this.
-5. **Refuse rather than guess.** If the section is malformed (duplicate or missing markers, lines focus didn't write, invalid hostnames), throw `HostsFormatError` and change nothing. The README's "Manual recovery" section is the escape hatch, so keep it accurate whenever the marker format changes.
+5. **Refuse rather than guess.** If the section is malformed (duplicate or missing markers, lines focus didn't write, invalid hostnames), throw `HostsFormatError` and change nothing. The "Manual recovery" sections in the README and the guide are the escape hatch, so keep both accurate whenever the marker format changes. The error message points to the README's heading, so don't rename it.
 6. **The hosts file is the only state.** The block list and on/off state live inside the section. Don't add a database or state file, and don't copy the list into the config file.
 
 ## Layout
@@ -54,11 +54,12 @@ Use Bun, not Node: run with `bun`, test with `bun:test`, use `Bun.file`/`Bun.wri
 | `src/upgrade.ts` | Self-update against the GitHub releases API. Network, token, binary path and the "run the new binary" step are all injected. |
 | `src/version.ts` | `VERSION` imported from `package.json`, which is the single source of truth. |
 | `scripts/build-release.ts` | Compiles, signs, smoke-tests `--version`, and writes `SHA256SUMS`. |
+| `docs/images/` | README screenshots, light and dark, exported at 2x from the Paper file "Patient umbrella", page "README — focus images". They're designed mockups of real output, so re-export them when the `init` checklist, `status` or diff output changes. |
 | `install.sh` | The POSIX sh installer. It uses `gh release download` when `gh` is authenticated, otherwise public URLs. |
 
 ## Design decisions (don't undo these without asking)
 
-- **Marker format** is exactly `# BEGIN focus` … `# END focus`. Inside are a `# state: on|off` line and `# preset: <id>` / `# sites` group headers. Older binaries treat the group headers as ordinary comments, so a 0.1.0 binary can still read a newer file. Each host gets two lines: `0.0.0.0 <host>` and `:: <host>`. `off` comments them out as `# 0.0.0.0 <host>`. The `sed` recovery command in the README depends on these markers.
+- **Marker format** is exactly `# BEGIN focus` … `# END focus`. Inside are a `# state: on|off` line and `# preset: <id>` / `# sites` group headers. Older binaries treat the group headers as ordinary comments, so a 0.1.0 binary can still read a newer file. Each host gets two lines: `0.0.0.0 <host>` and `:: <host>`. `off` comments them out as `# 0.0.0.0 <host>`. The `sed` recovery command in the README and the guide depends on these markers.
 - **`www.` expansion:** `add` and `remove` include the `www.` variant unless you pass `--exact` or the config sets `"exact": true`. Presets list exact hostnames and ignore the expansion.
 - **Presets are recorded, not just expanded.** The section groups hosts under `# preset: <id>` and `# sites`.
   - **Syncing:** every command starts from `syncSection(readSection(...))`, so any write brings presets up to date with the running version's catalog. `focus sync` does only that, and `focus upgrade` runs the new binary's `sync` after swapping it in.
@@ -81,7 +82,7 @@ Use Bun, not Node: run with `bun`, test with `bun:test`, use `Bun.file`/`Bun.wri
 
   Keep all three when adding commands or flags. A new flag that names a path or URL is a privilege-escalation risk.
 - **DNS is flushed only after writing the real `/etc/hosts`.** The check compares against `realpath("/etc/hosts")`. Any other path never triggers `dscacheutil` or `killall`.
-- **Writes are atomic and keep mode, uid and gid.** Extended attributes and ACLs are not kept. That trade-off is documented in the README.
+- **Writes are atomic and keep mode, uid and gid.** Extended attributes and ACLs are not kept. That trade-off is documented in the guide.
 
 ## macOS, Bun and GitHub gotchas
 
@@ -92,12 +93,12 @@ Use Bun, not Node: run with `bun`, test with `bun:test`, use `Bun.file`/`Bun.wri
   - **Tested:** visudo validation runs for real in `test/sudo.test.ts`. Elevation was checked up to sudo's prompt, with no cached login, so sudo refused before running anything.
   - **Not tested:** the `dscl` and `gh` lookups as the invoking user, and `setup-sudo` end to end. Agents can't use real sudo.
   - **macOS sudoers:** `/etc/sudoers` includes `/private/etc/sudoers.d`, and sudo ignores files there whose names contain a dot. That's why the temp file `.focus.focus-<pid>.tmp` is never read as a rule.
-- **Private repo:**
+- **GitHub auth:**
   - Release downloads need auth. `upgrade` gets a token from `GITHUB_TOKEN`/`GH_TOKEN` or `gh auth token`, and sends it only to `api.github.com`.
   - Asset downloads use `redirect: "manual"` and follow the storage redirect without the `Authorization` header, because the storage service rejects requests that carry it.
-  - The README's `curl | sh` one-liner works only once the repo is public. Until then, use the `gh release download … install.sh` command.
+  - The repo is public, so the README's `curl | sh` one-liner and unauthenticated release downloads work. `install.sh` still prefers `gh` when it's logged in.
 - **Interactive testing:** `init` needs a TTY. To drive it in a pseudo-terminal, use `script -q log sh -c 'stty cols 100 rows 40; bun src/cli.ts init'` and pipe keystrokes in with `sleep`s between them. Without `stty`, the terminal has zero columns and clack wraps every character onto its own line.
-- **CI cost:** CI runs on `macos-latest`, which uses a private repo's Actions minutes 10 times faster than Linux.
+- **CI:** runs on `macos-latest`. That's free for public repos; if the repo goes private again, macOS minutes count 10 times faster than Linux.
 
 ## Releasing
 
@@ -111,4 +112,4 @@ The asset names are used in three places: `src/upgrade.ts` (`ASSET` and `CHECKSU
 
 ## Follow-ups
 
-- **Allow chosen subreddits and block the rest of Reddit.** This can't be done in `/etc/hosts`, which only sees hostnames, and subreddits are paths. It needs a browser extension (preferred) or a proxy that intercepts TLS. See the README's "Follow-ups" section. Build it as a separate component, not a hosts-file feature.
+- **Allow chosen subreddits and block the rest of Reddit.** This can't be done in `/etc/hosts`, which only sees hostnames, and subreddits are paths. It needs a browser extension (preferred) or a proxy that intercepts TLS. See the guide's "Follow-ups" section. Build it as a separate component, not a hosts-file feature.
