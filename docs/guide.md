@@ -296,7 +296,7 @@ Reddit is only restricted once `~/.config/focus/subreddits.json` exists, so inst
 - **Removing your last blocked site** deletes the hosts section, so `focus on` has nothing to turn on, and the extension stops restricting anything. `focus feeds add` and `focus reddit allow` warn about this.
 - **Sites change.** YouTube and X rename their pages and page elements from time to time. When they do, a feed or a recommendation can slip through until focus is updated.
 - **Keep Developer mode on.** Chrome disables an extension loaded from a folder when it reloads, such as after an update, if Developer mode is off. Chrome may also remind you that a developer-mode extension is installed.
-- **After `focus upgrade`:** focus updates the extension's files, and the extension reloads itself the next time it talks to focus, when you next open one of these sites. `focus chrome update` updates the files by hand; you never need to load the extension again.
+- **After `focus upgrade`:** focus updates the extension's files; restart Chrome to use the new version (or click ↻ on focus at `chrome://extensions`). The extension may also reload itself the next time it talks to focus, but restarting is the sure way. `focus chrome update` updates the files by hand; you never need to load the extension again.
 
 ### Removing it
 

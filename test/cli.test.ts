@@ -1345,11 +1345,22 @@ describe("reddit", () => {
     await oldExtension(fake);
     const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "chrome", "update");
     expect(result.code).toBe(0);
-    expect(result.stdout).toStartWith(`Updated the Chrome extension's files from 0.1.3 to ${VERSION}. Chrome reloads it`);
+    // Chrome hasn't loaded it here, so restarting wouldn't help.
+    expect(result.stdout).toBe(`Updated the Chrome extension's files from 0.1.3 to ${VERSION}. Chrome hasn't loaded it yet; run \`focus chrome install\`.\n`);
     expect(await Bun.file(join(fake.chrome.extensionDir, "manifest.json")).json()).toMatchObject({ version_name: VERSION });
     expect(await Bun.file(join(fake.chrome.extensionDir, "background.js")).text()).not.toBe("// old");
     const again = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "chrome", "update");
     expect(again.stdout).toBe(`The Chrome extension's files are up to date (${VERSION}).\n`);
+  });
+
+  test("after updating the files of a loaded extension, chrome update says to restart Chrome", async () => {
+    const fake = fakeChrome();
+    await oldExtension(fake);
+    await fake.saveProfile(true);
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "chrome", "update");
+    expect(result.stdout).toBe(
+      `Updated the Chrome extension's files from 0.1.3 to ${VERSION}. Restart Chrome to use the new version (or click ↻ on focus at chrome://extensions).\n`,
+    );
   });
 
   test("chrome update says when there's nothing installed", async () => {

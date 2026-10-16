@@ -577,8 +577,9 @@ async function chrome(args: string[], hostsPath: string, purpose: "reddit" | nul
 
 /**
  * Brings the extension's folder up to this version if it's from another one, and says so.
- * A loaded extension then reloads itself the next time it checks in with focus; one Chrome
- * hasn't loaded yet gets the current files when it is. Only the installed binary does this,
+ * Chrome keeps running the copy it loaded until it restarts (the extension can also reload
+ * itself when it next checks in with focus, but that isn't dependable), so say to restart it.
+ * One Chrome hasn't loaded yet gets the current files when it is. Only the installed binary does this,
  * so running from source never rewrites the real folder. Resolves whether it wrote anything.
  */
 async function updateExtensionFiles(io: Io): Promise<boolean> {
@@ -586,9 +587,12 @@ async function updateExtensionFiles(io: Io): Promise<boolean> {
   const installed = await installedExtensionVersion(io.chrome.extensionDir);
   if (installed === VERSION) return false;
   await writeExtension(io.chrome.extensionSource, io.chrome.extensionDir, VERSION);
+  const loaded = await chromeProfiles(io);
   io.stdout(
     `Updated the Chrome extension's files${installed ? ` from ${installed}` : ""} to ${VERSION}. ` +
-      "Chrome reloads it the next time it checks in with focus, when you next open Reddit, YouTube or X.\n",
+      (loaded?.length === 0
+        ? "Chrome hasn't loaded it yet; run `focus chrome install`.\n"
+        : "Restart Chrome to use the new version (or click ↻ on focus at chrome://extensions).\n"),
   );
   return true;
 }
