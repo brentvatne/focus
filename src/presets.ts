@@ -95,6 +95,53 @@ export function findPreset(id: string, catalog = PRESETS): Preset | undefined {
 }
 
 /**
+ * Presets that `word` looks like a mistyped name for, best matches first (several only
+ * on a tie). Compares against each id and the words of each name ("twitter",
+ * "hackernews"), allowing a typo or two depending on length, or a prefix of 3+ letters.
+ */
+export function suggestPresets(word: string, catalog = PRESETS): Preset[] {
+  const typed = word
+    .toLowerCase()
+    .replace(/^www\./, "")
+    .replace(/\.[a-z]+$/, "")
+    .replace(/[^a-z0-9]/g, "");
+  if (typed === "") return [];
+  let best = Infinity;
+  let matches: Preset[] = [];
+  for (const preset of catalog) {
+    const names = [preset.id, ...preset.name.toLowerCase().split("/").map((part) => part.replace(/[^a-z0-9]/g, ""))];
+    const score = Math.min(...names.map((name) => matchScore(typed, name)));
+    if (score < best) [best, matches] = [score, [preset]];
+    else if (score === best && score !== Infinity) matches.push(preset);
+  }
+  return matches;
+}
+
+function matchScore(typed: string, name: string): number {
+  if (typed === name) return 0;
+  const allowed = name.length <= 3 ? 0 : name.length <= 5 ? 1 : 2;
+  const distance = editDistance(typed, name);
+  if (distance <= allowed) return distance;
+  return typed.length >= 3 && name.startsWith(typed) ? allowed + 1 : Infinity;
+}
+
+/** Levenshtein distance, counting a swap of two adjacent letters as one edit. */
+function editDistance(a: string, b: string): number {
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array<number>(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0]![j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i]![j] = Math.min(d[i - 1]![j]! + 1, d[i]![j - 1]! + 1, d[i - 1]![j - 1]! + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i]![j] = Math.min(d[i]![j]!, d[i - 2]![j - 2]! + 1);
+      }
+    }
+  }
+  return d[a.length]![b.length]!;
+}
+
+/**
  * Rebuilds every preset group from the catalog, so presets pick up hosts added
  * (or drop hosts removed) in newer versions. A preset that no longer exists has
  * its hosts kept as sites, and sites already covered by a preset are dropped.

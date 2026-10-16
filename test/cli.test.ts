@@ -426,8 +426,65 @@ describe("presets with add and remove", () => {
     const result = await focus("remove", "api.x.com");
     expect(result.code).toBe(0);
     expect(result.stderr).toContain("api.x.com is blocked by the X / Twitter preset");
-    expect(result.stderr).toContain("focus remove --preset x");
+    expect(result.stderr).toContain("run `focus remove x`");
     expect(await read()).toBe(before);
+  });
+
+  test("a preset name works without --preset, mixed with hostnames", async () => {
+    expect((await focus("add", "YouTube", "a.com")).code).toBe(0);
+    expect((await focus("status")).stdout).toContain("Presets:    YouTube\nSites (2):\n  a.com\n  www.a.com\n");
+    expect((await focus("add", "youtube")).stderr).toContain("the youtube preset is already on");
+    expect((await focus("remove", "youtube", "a.com")).code).toBe(0);
+    expect(await read()).toBe(ORIGINAL);
+    expect((await focus("rm", "youtube")).stderr).toContain("the youtube preset isn't on");
+  });
+
+  test("a host covered by a preset added in the same command is reported, not listed twice", async () => {
+    const result = await focus("add", "--exact", "youtube", "youtube.com");
+    expect(result.stderr).toContain("youtube.com is already blocked by the YouTube preset");
+    expect((await focus("status")).stdout).not.toContain("Sites");
+  });
+
+  test("removing a preset and one of its hosts together doesn't point back at the preset", async () => {
+    await focus("init", "x");
+    const result = await focus("remove", "x", "api.x.com");
+    expect(result.stderr).toBe(`focus: api.x.com is not listed\n`);
+    expect(await read()).toBe(ORIGINAL);
+  });
+
+  test("suggests the preset a typo was probably meant to be, and changes nothing", async () => {
+    for (const [typo, suggestion] of [
+      ["youtub", "youtube"],
+      ["yuotube", "youtube"],
+      ["twitter", "x"],
+      ["hacker-news", "hackernews"],
+      ["insta", "instagram"],
+    ]) {
+      const result = await focus("add", typo!, "a.com");
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain(`unknown preset '${typo}'; did you mean '${suggestion}'?`);
+    }
+    expect((await focus("remove", "redit")).stderr).toContain("did you mean 'reddit'?");
+    expect((await focus("add", "--preset", "youtube.com")).stderr).toContain("did you mean 'youtube'?");
+    expect((await focus("init", "messanger")).stderr).toContain("did you mean 'messenger'?");
+    expect(await read()).toBe(ORIGINAL);
+  });
+
+  test("a word that's neither a preset nor close to one asks for a domain", async () => {
+    const result = await focus("add", "foo");
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("'foo' isn't a preset or a hostname; presets are x, facebook,");
+    expect(result.stderr).toContain("hostnames need a domain, e.g. 'foo.com'");
+  });
+
+  test("other invalid arguments still get the hostname error", async () => {
+    const result = await focus("add", "https://youtube.com/watch");
+    expect(result.stderr).toContain("expected a hostname, not a URL. Did you mean 'youtube.com'?");
+  });
+
+  test("--preset still treats every argument as a preset", async () => {
+    expect((await focus("add", "--preset", "a.com")).stderr).toContain("unknown preset 'a.com'; choose from:");
+    expect((await focus("add", "--preset")).stderr).toContain("add needs at least one preset name");
   });
 
   test("adding a host a preset already blocks is a no-op", async () => {
@@ -847,7 +904,7 @@ describe("reddit", () => {
     await focus("init", "reddit", "x");
     const dns = await focus("reddit", "allow", "de");
     expect(dns.stderr).toContain("still blocks all of Reddit");
-    expect(dns.stderr).toContain("focus remove --preset reddit");
+    expect(dns.stderr).toContain("focus remove reddit");
   });
 
   test.each([[["reddit"]], [["reddit", "frobnicate"]], [["reddit", "allow"]], [["reddit", "list", "x"]], [["reddit", "allow", "-n", "rust"]]])(

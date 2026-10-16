@@ -20,6 +20,7 @@ Apple silicon only. Run `focus setup-sudo` once if you don't want to type your p
 
 ```bash
 focus init               # choose presets: X, Facebook, YouTube, Reddit, …
+focus add instagram      # turn on one more preset (`focus remove` turns it off)
 focus add example.com    # block anything else
 focus                    # toggle blocking on or off
 focus off                # take a break; `focus on` to resume

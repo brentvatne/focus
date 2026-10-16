@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { normalizeHostname } from "../src/hostname.ts";
-import { PRESETS, type Preset, findPreset, presetBlocking, syncSection, withPresets } from "../src/presets.ts";
+import {
+  PRESETS,
+  type Preset,
+  findPreset,
+  presetBlocking,
+  suggestPresets,
+  syncSection,
+  withPresets,
+} from "../src/presets.ts";
 
 describe("PRESETS", () => {
   test("ids are unique", () => {
@@ -132,5 +140,39 @@ describe("withPresets and presetBlocking", () => {
     expect(presetBlocking(current, "api.x.com")?.id).toBe("x");
     expect(presetBlocking(current, "youtube.com")).toBeUndefined();
     expect(presetBlocking(null, "x.com")).toBeUndefined();
+  });
+});
+
+describe("suggestPresets", () => {
+  const ids = (word: string) => suggestPresets(word).map((preset) => preset.id);
+
+  test.each([
+    ["youtub", "youtube"],
+    ["yuotube", "youtube"],
+    ["YOUTUBE", "youtube"],
+    ["twitter", "x"],
+    ["twiter", "x"],
+    ["hacker-news", "hackernews"],
+    ["Hacker News", "hackernews"],
+    ["hacker", "hackernews"],
+    ["insta", "instagram"],
+    ["tiktk", "tiktok"],
+    ["messanger", "messenger"],
+    ["reddit.com", "reddit"],
+    ["www.facebook.com", "facebook"],
+  ])("%s suggests %s", (word, id) => {
+    expect(ids(word)).toEqual([id]);
+  });
+
+  test.each(["foo", "example", "news", "y", "xx", "fb", "tok", "", "--"])("%p suggests nothing", (word) => {
+    expect(ids(word)).toEqual([]);
+  });
+
+  test("lists every preset on a tie", () => {
+    const catalog: Preset[] = [
+      { id: "abcd", name: "Abcd", hosts: ["abcd.com"], recommended: false },
+      { id: "abce", name: "Abce", hosts: ["abce.com"], recommended: false },
+    ];
+    expect(suggestPresets("abcx", catalog).map((preset) => preset.id)).toEqual(["abcd", "abce"]);
   });
 });
