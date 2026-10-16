@@ -42,7 +42,7 @@ async function recheck() {
   }
   const error = element("error");
   error.hidden = !reply?.hostError;
-  if (reply?.hostError) setWithCode(error, `${reply.hostError}. If this persists, run \`focus reddit install\`.`);
+  if (reply?.hostError) setWithCode(error, reply.hostError);
 }
 
 void recheck();

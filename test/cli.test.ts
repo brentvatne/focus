@@ -482,6 +482,16 @@ describe("presets with add and remove", () => {
     expect(result.stderr).toContain("expected a hostname, not a URL. Did you mean 'youtube.com'?");
   });
 
+  test("adding one of a preset's hostnames points to the preset", async () => {
+    const result = await focus("add", "youtube.com");
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe(
+      "focus: tip: `focus add youtube` blocks all of the YouTube preset, including m.youtube.com, youtu.be\n",
+    );
+    expect((await focus("status")).stdout).toContain("Sites (2):\n  youtube.com\n  www.youtube.com\n");
+    expect((await focus("add", "youtube", "a.com")).stderr).toBe("");
+  });
+
   test("--preset still treats every argument as a preset", async () => {
     expect((await focus("add", "--preset", "a.com")).stderr).toContain("unknown preset 'a.com'; choose from:");
     expect((await focus("add", "--preset")).stderr).toContain("add needs at least one preset name");
@@ -882,6 +892,15 @@ describe("reddit", () => {
     expect((await focus("reddit", "list")).stdout).toBe("r/de\n");
 
     expect(await read()).toBe(hostsBefore);
+  });
+
+  test("rejects options that don't apply instead of ignoring them", async () => {
+    for (const flag of ["--exact", "--no-flush", "--preset", "--yes"]) {
+      const result = await focus("reddit", "allow", flag, "rust");
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain(`--${flag.replace(/^--(no-)?/, "")} doesn't apply to focus reddit`);
+    }
+    expect(await Bun.file(allowlist()).exists()).toBe(false);
   });
 
   test("list says when nothing is allowed", async () => {

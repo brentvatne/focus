@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { UNKNOWN_POLICY, buildRules, evaluate, isAllowed, isBareComments, mayStay, subredditOf } from "../extension/rules.js";
+import {
+  UNKNOWN_POLICY,
+  buildRules,
+  evaluate,
+  isAllowed,
+  isBarePost,
+  mayStay,
+  postIdOf,
+  subredditOf,
+} from "../extension/rules.js";
 import { MAX_SUBREDDITS } from "../src/subreddits.ts";
 
 const on = { state: "on" as const, allow: ["rust", "de"] };
@@ -19,7 +28,10 @@ describe("isAllowed while focus is on", () => {
     "https://www.reddit.com/register",
     "https://out.reddit.com/t3_abc?url=https%3A%2F%2Fexample.com",
     "https://www.reddit.com/comments/abc123",
+    "https://www.reddit.com/gallery/abc123",
+    "https://www.reddit.com/media?url=https%3A%2F%2Fi.redd.it%2Fabc.jpg",
     "https://redd.it/abc123",
+    "https://www.reddit.com/r/rust/searchable",
   ])("allows %s", (url) => {
     expect(isAllowed(on, url)).toBe(true);
   });
@@ -35,9 +47,12 @@ describe("isAllowed while focus is on", () => {
     "https://www.reddit.com/search/?q=rust",
     "https://www.reddit.com/r/rust/search/?q=x&restrict_sr=off",
     "https://old.reddit.com/r/rust/search?q=x",
+    "https://old.reddit.com/r/rust/search.rss?q=x&restrict_sr=off",
+    "https://www.reddit.com/r/rust/search.json?q=x",
+    "https://www.reddit.com/r/rust/duplicates/abc123",
+    "https://www.reddit.com/r/rust/api/info.json?id=t3_abc",
     "https://amp.reddit.com/r/pics/",
     "https://m.reddit.com/",
-    "https://www.reddit.com/media?url=x",
   ])("blocks %s", (url) => {
     expect(isAllowed(on, url)).toBe(false);
   });
@@ -56,11 +71,14 @@ describe("isAllowed while focus is on", () => {
     expect(evaluate(buildRules(on), url, "sub_frame")).toBeNull();
   });
 
-  test("bare /comments/<id> is allowed as a page but not as a frame", () => {
-    const rules = buildRules(on);
-    expect(evaluate(rules, "https://www.reddit.com/comments/abc123", "main_frame")).toBe("allow");
-    expect(evaluate(rules, "https://www.reddit.com/comments/abc123", "sub_frame")).toBe("block");
-  });
+  test.each(["https://www.reddit.com/comments/abc123", "https://www.reddit.com/gallery/abc123", "https://www.reddit.com/media?url=x"])(
+    "%s is allowed as a page but not as a frame",
+    (url) => {
+      const rules = buildRules(on);
+      expect(evaluate(rules, url, "main_frame")).toBe("allow");
+      expect(evaluate(rules, url, "sub_frame")).toBe("block");
+    },
+  );
 });
 
 describe("buildRules", () => {
@@ -92,16 +110,39 @@ describe("buildRules", () => {
   });
 });
 
-test("mayStay uses the subreddit a bare comments page reported", () => {
-  const post = "https://www.reddit.com/comments/abc123";
-  expect(mayStay(on, post, "rust")).toBe(true);
-  expect(mayStay(on, post, "Pics")).toBe(false);
-  expect(mayStay(on, post, null)).toBe(false);
-  expect(mayStay({ state: "off", allow: [] }, post, null)).toBe(true);
-  expect(mayStay(on, "https://www.reddit.com/r/rust/", null)).toBe(true);
-  expect(mayStay(on, "https://www.reddit.com/r/pics/", "rust")).toBe(false);
-  expect(isBareComments(post)).toBe(true);
-  expect(isBareComments("https://www.reddit.com/r/rust/comments/abc123")).toBe(false);
+describe("mayStay", () => {
+  test.each(["https://www.reddit.com/comments/abc123", "https://old.reddit.com/gallery/abc123"])(
+    "a bare post %s needs the subreddit it reported to be allowed",
+    (post) => {
+      expect(mayStay(on, post, "rust")).toBe(true);
+      expect(mayStay(on, post, "Pics")).toBe(false);
+      expect(mayStay(on, post, null)).toBe(false);
+      expect(mayStay({ state: "off", allow: [] }, post, null)).toBe(true);
+    },
+  );
+
+  test("a post under an allowed subreddit's URL must be from that subreddit", () => {
+    const post = "https://old.reddit.com/r/rust/comments/abc123/title/";
+    expect(mayStay(on, post, "rust")).toBe(true);
+    expect(mayStay(on, post, "pics")).toBe(false);
+    expect(mayStay(on, post, null)).toBe(true);
+  });
+
+  test("the URL's own rules still apply", () => {
+    expect(mayStay(on, "https://www.reddit.com/r/rust/", null)).toBe(true);
+    expect(mayStay(on, "https://www.reddit.com/r/pics/", "rust")).toBe(false);
+  });
+});
+
+test("postIdOf and isBarePost", () => {
+  expect(postIdOf("https://www.reddit.com/comments/AbC123")).toBe("abc123");
+  expect(postIdOf("https://www.reddit.com/gallery/abc123?x=1")).toBe("abc123");
+  expect(postIdOf("https://www.reddit.com/r/rust/comments/abc123/title/")).toBe("abc123");
+  expect(postIdOf("https://www.reddit.com/r/rust/")).toBeNull();
+  expect(postIdOf("https://www.reddit.com/user/x/comments/abc123")).toBeNull();
+  expect(isBarePost("https://www.reddit.com/comments/abc123")).toBe(true);
+  expect(isBarePost("https://www.reddit.com/gallery/abc123")).toBe(true);
+  expect(isBarePost("https://www.reddit.com/r/rust/comments/abc123")).toBe(false);
 });
 
 test("subredditOf", () => {

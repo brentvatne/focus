@@ -97,7 +97,7 @@ export function findPreset(id: string, catalog = PRESETS): Preset | undefined {
 /**
  * Presets that `word` looks like a mistyped name for, best matches first (several only
  * on a tie). Compares against each id and the words of each name ("twitter",
- * "hackernews"), allowing a typo or two depending on length, or a prefix of 3+ letters.
+ * "hackernews"), allowing one typo (none in names of 3 letters or fewer), or a prefix of 3+ letters.
  */
 export function suggestPresets(word: string, catalog = PRESETS): Preset[] {
   const typed = word
@@ -119,7 +119,8 @@ export function suggestPresets(word: string, catalog = PRESETS): Preset[] {
 
 function matchScore(typed: string, name: string): number {
   if (typed === name) return 0;
-  const allowed = name.length <= 3 ? 0 : name.length <= 5 ? 1 : 2;
+  // One edit, not two: two would turn "credit" into reddit and "passenger" into messenger.
+  const allowed = name.length <= 3 ? 0 : 1;
   const distance = editDistance(typed, name);
   if (distance <= allowed) return distance;
   return typed.length >= 3 && name.startsWith(typed) ? allowed + 1 : Infinity;

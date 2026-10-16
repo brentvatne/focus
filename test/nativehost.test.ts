@@ -83,12 +83,19 @@ describe("respond", () => {
     } as never);
   });
 
-  test("reports a malformed section or allowlist as an error, never as off", async () => {
+  test("reports a malformed section as an error, never as off", async () => {
     await Bun.write(hosts, "# BEGIN focus\n0.0.0.0 x.com\n");
     expect(await respond({ type: "status" }, deps())).toMatchObject({ state: "error", error: expect.stringMatching(/malformed/) });
-    await Bun.write(hosts, section("on", "x.com"));
+  });
+
+  test("a malformed allowlist allows nothing but keeps the real state, so off still means off", async () => {
     await Bun.write(allowlist, '{"version":1,"allow":["all"]}');
-    expect(await respond({ type: "status" }, deps())).toMatchObject({ state: "error", error: expect.stringMatching(/feed/) });
+    for (const state of ["on", "off"] as const) {
+      await Bun.write(hosts, section(state, "x.com"));
+      const reply = await respond({ type: "status" }, deps());
+      expect(reply).toMatchObject({ state, allow: [], allowlistError: expect.stringMatching(/feed/) });
+      expect(reply).not.toHaveProperty("error");
+    }
   });
 
   test("refuses anything but a status request", async () => {

@@ -213,7 +213,11 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
   if (io.isRoot && !targetsSystemHosts) {
     throw new UsageError(`as root, focus only manages ${io.systemHostsFile}; --hosts-file and FOCUS_HOSTS_FILE can't point elsewhere`);
   }
-  if (command === "reddit") return reddit(args, hostsPath, values["dry-run"] ?? false, io);
+  if (command === "reddit") {
+    const ignored = (["exact", "flush", "preset", "yes"] as const).filter((name) => values[name] !== undefined);
+    if (ignored.length > 0) throw new UsageError(`--${ignored[0]} doesn't apply to focus reddit`);
+    return reddit(args, hostsPath, values["dry-run"] ?? false, io);
+  }
   // A bare `focus` with nothing to toggle shows help instead of asking sudo for nothing.
   if (command === undefined && !readSection((await readHostsFile(hostsPath)).content)) {
     io.stdout(USAGE + "\n");
@@ -526,6 +530,12 @@ function planChange(
       for (const id of ids) if (enabled.includes(id)) io.stderr(`focus: the ${id} preset is already on\n`);
       // Presets first, so a host that a newly added preset covers is reported as covered.
       const next = ids.length > 0 ? withPresets(current, [...enabled, ...ids]) : current;
+      for (const preset of offPresetsOwning(hosts, next)) {
+        const others = preset.hosts.filter((host) => !expand(hosts, options.exact).includes(host));
+        io.stderr(
+          `focus: tip: \`focus add ${preset.id}\` blocks all of the ${preset.name} preset, including ${others.join(", ")}\n`,
+        );
+      }
       const added: string[] = [];
       for (const host of expand(hosts, options.exact)) {
         const preset = presetBlocking(next, host);
@@ -570,6 +580,12 @@ function planChange(
     default:
       throw new UsageError(`unknown command '${command}'`);
   }
+}
+
+/** Catalog presets, not enabled in `section`, that list one of `hosts`. */
+function offPresetsOwning(hosts: string[], section: FocusSection | null): Preset[] {
+  const enabled = new Set(section?.presets.map((group) => group.id));
+  return PRESETS.filter((preset) => !enabled.has(preset.id) && hosts.some((host) => preset.hosts.includes(host)));
 }
 
 async function choosePresets(

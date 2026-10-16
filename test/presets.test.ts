@@ -164,7 +164,7 @@ describe("suggestPresets", () => {
     expect(ids(word)).toEqual([id]);
   });
 
-  test.each(["foo", "example", "news", "y", "xx", "fb", "tok", "", "--"])("%p suggests nothing", (word) => {
+  test.each(["foo", "example", "news", "y", "xx", "fb", "tok", "", "--", "credit", "edit", "glitter", "passenger"])("%p suggests nothing", (word) => {
     expect(ids(word)).toEqual([]);
   });
 

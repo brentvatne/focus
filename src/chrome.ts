@@ -76,8 +76,16 @@ export async function writeExtension(source: string, target: string, version: st
     }
     const replacing = await isDirectory(target);
     if (replacing) await rename(target, previous);
-    await rename(staging, target);
-    if (replacing) await rm(previous, { recursive: true, force: true });
+    try {
+      await rename(staging, target);
+    } catch (error) {
+      // Put the working copy back; Chrome disables an unpacked extension whose folder is gone.
+      if (replacing && !(await isDirectory(target))) await rename(previous, target).catch(() => {});
+      throw error;
+    } finally {
+      // Never delete the old copy while it's the only one.
+      if (await isDirectory(target)) await rm(previous, { recursive: true, force: true });
+    }
   } catch (error) {
     await rm(staging, { recursive: true, force: true });
     throw error;

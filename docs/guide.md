@@ -242,8 +242,9 @@ focus status                       # shows the list too
 
 While focus is on:
 
-- **Loads:** the allowed subreddits on any Reddit hostname (`www`, `old`, `new` and so on), including their posts, images and video; signing in; links to other sites; and `redd.it` shortlinks to posts in allowed subreddits.
-- **Blocked:** everything else on Reddit: the home page, `r/all` and `r/popular`, other subreddits, multireddits (`r/a+b`), profiles, and search, including a subreddit's own search, which can search all of Reddit.
+- **Loads:** the allowed subreddits on any Reddit hostname (`www`, `old`, `new` and so on), including their posts, galleries, images and video; signing in; links to other sites; and `redd.it` shortlinks to posts in allowed subreddits.
+- **Blocked:** everything else on Reddit: the home page, `r/all` and `r/popular`, other subreddits, multireddits (`r/a+b`), profiles, and search. Within an allowed subreddit, its search (which can search all of Reddit), its duplicates page and its API pages are blocked too.
+- **Posts are checked by where they really are.** A post opened through a link that doesn't name its subreddit (`redd.it/<id>`, `/comments/<id>`, `/gallery/<id>`), or under another subreddit's address, is checked against the subreddit the page itself names.
 - **Not covered:** posts from other subreddits that Reddit shows inside an allowed page (recommendations, crossposts, sidebars). focus restricts which pages you can open, not every piece of content on them.
 
 ### How it works
@@ -251,6 +252,8 @@ While focus is on:
 - **Blocking:** the extension uses Chrome's declarativeNetRequest rules to block Reddit pages that aren't allowed, and shows its own page explaining why. It never blocks Reddit's scripts, images, video or API calls, so allowed subreddits keep working when Reddit changes its site. Reddit sometimes changes pages without a full reload; the extension notices and sends those tabs to the blocked page, so a page can flash briefly first.
 - **The list:** it lives in `~/.config/focus/subreddits.json`, which belongs to you. It's separate from `/etc/hosts` and from `config.json`, and root never reads it.
 - **On or off:** the extension asks focus whether blocking is on and what's allowed. Chrome starts the focus binary for each question (native messaging), and focus reads `/etc/hosts` and the list, answers and exits. Nothing keeps running. The extension remembers the last answer, so if focus can't be reached, it keeps the last rules.
+- **A broken list:** if `subreddits.json` can't be read, focus answers with an empty list and the blocked page says why. While focus is on, that blocks every subreddit; `focus off` still turns blocking off.
+- **Incognito:** the extension's own pages can't open in Incognito windows, so a blocked page there shows Chrome's "blocked" error page instead, sometimes for Reddit's home page rather than the link itself.
 
 ### Timing
 
