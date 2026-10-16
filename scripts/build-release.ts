@@ -11,7 +11,7 @@ const binary = join(outDir, ASSET);
 await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });
 
-await $`bun build --compile --minify --target=bun-darwin-arm64 src/cli.ts --outfile ${binary}`.cwd(join(import.meta.dir, ".."));
+await $`bun build --compile --minify --target=bun-darwin-arm64 src/cli.ts --asset ./extension --outfile ${binary}`.cwd(join(import.meta.dir, ".."));
 // Bun's embedded ad-hoc signature is invalid once the bundle is appended, and macOS kills unsigned arm64 binaries.
 await $`codesign --sign - --force ${binary}`;
 

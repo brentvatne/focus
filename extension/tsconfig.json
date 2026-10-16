@@ -1,0 +1,17 @@
+{
+  // The Chrome extension: plain JavaScript, checked with the DOM and chrome.* types.
+  // The root tsconfig excludes this folder; `bun run typecheck` runs both.
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM"],
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["chrome"],
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": ["*.js"]
+}

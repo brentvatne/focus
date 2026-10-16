@@ -54,6 +54,7 @@ focus remove example.com           # also removes www.example.com unless --exact
 focus off                          # stop blocking but keep the list
 focus on                           # start blocking again
 focus                              # toggle: off if it's on, on if it's off
+focus reddit allow rust            # let a subreddit through in Chrome (see "Allowing subreddits")
 focus sync                         # update presets to this version's hostnames
 focus status                            # read-only
 ```
@@ -198,15 +199,79 @@ Presets come first, each under its own `# preset:` header and in catalog order. 
 - Browsers that use DNS-over-HTTPS in a strict mode (such as Firefox's "Max Protection"), VPNs and proxies can bypass `/etc/hosts`.
 - The rename replaces the file. It keeps mode and ownership but not extended attributes or ACLs.
 
-## Follow-ups
+## Allowing subreddits (Chrome)
 
-These are deliberately out of scope for v1.
+The `reddit` preset blocks all of Reddit. To keep a few subreddits instead, focus comes with a Chrome extension: while focus is on, Chrome loads only the subreddits you allow and blocks the rest of Reddit. While focus is off, Reddit is unrestricted, as with everything else.
 
-- **Allow certain subreddits and block the rest of Reddit.** This can't be done with `/etc/hosts`. Every subreddit is a path on the same hostname (`reddit.com/r/...`), and the hosts file only sees hostnames. Over HTTPS, nothing outside the browser can see the path without intercepting TLS. The realistic options are:
-  - **A browser extension (preferred).** It can use Chrome's `declarativeNetRequest` or Firefox's `webRequest` to block `*://*.reddit.com/*` but allow `/r/<name>/*` on `www`, `old` and `new.reddit.com`. Rules would have to cover subreddit assets, the API calls new Reddit makes, and redirects from `/` and `/r/all`.
-  - **A local proxy that intercepts TLS.** It works across browsers, but it needs a trusted root certificate, which makes it heavier and riskier.
+The hosts file can't do this itself. Every subreddit is a path on the same hostnames (`reddit.com/r/...`), and `/etc/hosts` only sees hostnames, so the extension does the blocking inside Chrome.
 
-  Either one is a separate component from the hosts file. focus could manage it later, for example with `focus reddit allow <subreddit>`.
+### Setting it up
+
+```bash
+focus reddit install                 # writes the extension and registers focus with Chrome
+```
+
+Then, once, in Chrome:
+
+1. Open `chrome://extensions` and turn on **Developer mode**.
+2. Click **Load unpacked** and choose `~/Library/Application Support/focus/chrome-extension`. `install` opens it in Finder; in the file picker, press Cmd-Shift-G and paste the path.
+3. Click **Details** on "focus: allowed subreddits" and turn on **Allow in Incognito**.
+
+Then choose subreddits, and turn off the DNS block, which would otherwise stop every subreddit before Chrome sees it:
+
+```bash
+focus reddit allow rust AskHistorians    # also accepts r/rust or a subreddit URL
+focus remove --preset reddit
+```
+
+Check that an allowed subreddit loads and another one shows focus's blocked page. If it doesn't, `focus add --preset reddit` blocks all of Reddit again.
+
+### Day to day
+
+```bash
+focus reddit allow <name...>       # let more subreddits through
+focus reddit disallow <name...>    # take them off the list
+focus reddit list
+focus status                       # shows the list too
+```
+
+`focus on`, `focus off` and `focus` (toggle) control the extension too. There's nothing else to switch.
+
+### What loads and what doesn't
+
+While focus is on:
+
+- **Loads:** the allowed subreddits on any Reddit hostname (`www`, `old`, `new` and so on), including their posts, images and video; signing in; links to other sites; and `redd.it` shortlinks to posts in allowed subreddits.
+- **Blocked:** everything else on Reddit: the home page, `r/all` and `r/popular`, other subreddits, multireddits (`r/a+b`), profiles, and search, including a subreddit's own search, which can search all of Reddit.
+- **Not covered:** posts from other subreddits that Reddit shows inside an allowed page (recommendations, crossposts, sidebars). focus restricts which pages you can open, not every piece of content on them.
+
+### How it works
+
+- **Blocking:** the extension uses Chrome's declarativeNetRequest rules to block Reddit pages that aren't allowed, and shows its own page explaining why. It never blocks Reddit's scripts, images, video or API calls, so allowed subreddits keep working when Reddit changes its site. Reddit sometimes changes pages without a full reload; the extension notices and sends those tabs to the blocked page, so a page can flash briefly first.
+- **The list:** it lives in `~/.config/focus/subreddits.json`, which belongs to you. It's separate from `/etc/hosts` and from `config.json`, and root never reads it.
+- **On or off:** the extension asks focus whether blocking is on and what's allowed. Chrome starts the focus binary for each question (native messaging), and focus reads `/etc/hosts` and the list, answers and exits. Nothing keeps running. The extension remembers the last answer, so if focus can't be reached, it keeps the last rules.
+
+### Timing
+
+- **First page after a change:** after `focus on`, `focus off` or a change to the list, the first Reddit page you open still uses the previous rules. The extension corrects itself straight after, usually within a second, and sends any open tabs that are no longer allowed to the blocked page.
+- **Tabs already open:** they catch up within about a minute, or sooner when you open another Reddit page.
+- **The blocked page:** it checks again whenever you switch back to it, and returns to the link once it's allowed.
+
+### Limits
+
+- **Chrome only.** With the `reddit` preset off, Reddit is open in Safari, the Reddit app, other Chrome profiles, and Incognito unless you allowed the extension there.
+- **Removing your last blocked site** deletes the hosts section, so `focus on` has nothing to turn on, and the extension stops restricting Reddit. `focus reddit allow` warns about this.
+- **Developer mode:** Chrome may remind you that a developer-mode extension is installed.
+- **After `focus upgrade`:** the extension updates itself the next time it talks to focus.
+
+### Removing it
+
+```bash
+focus reddit uninstall           # removes the extension's folder and focus's registration with Chrome
+focus add --preset reddit        # blocks all of Reddit again
+```
+
+Then remove "focus: allowed subreddits" at `chrome://extensions`. Your list stays in `~/.config/focus/subreddits.json`.
 
 ## Manual recovery
 
@@ -244,7 +309,14 @@ Use these steps if focus is broken or uninstalled, or if it reports a malformed 
 
 6. **Remove the sudoers rule,** if you installed one and are uninstalling focus: `sudo rm /etc/sudoers.d/focus`.
 
-7. **Flush DNS and verify:**
+7. **Remove the Chrome extension,** if you set up allowed subreddits. The extension keeps its last rules when it can't reach focus, so neither `focus off` nor the steps above unblock Reddit in Chrome if focus is broken. Remove "focus: allowed subreddits" at `chrome://extensions`, then delete what `focus reddit install` wrote:
+
+   ```bash
+   rm -rf ~/Library/Application\ Support/focus/chrome-extension
+   rm ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/com.brentvatne.focus.json
+   ```
+
+8. **Flush DNS and verify:**
 
    ```bash
    sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder

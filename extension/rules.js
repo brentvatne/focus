@@ -1,0 +1,142 @@
+// @ts-check
+// The blocking policy as declarativeNetRequest rules, plus a small evaluator of
+// those same rules, so the navigation checks in background.js can't drift from
+// what Chrome enforces. Pure: no chrome.* or DOM, so bun test imports it too.
+
+/** Bumped when the messages between the extension and `focus` change shape. */
+export const PROTOCOL = 1;
+
+/**
+ * @typedef {"on" | "off" | "none"} State
+ * @typedef {{ state: State, allow: string[] }} Policy
+ * @typedef {"main_frame" | "sub_frame"} FrameType
+ * @typedef {{
+ *   id: number,
+ *   priority: number,
+ *   action: { type: "allow" | "block" },
+ *   condition: { regexFilter?: string, requestDomains?: string[], resourceTypes: FrameType[] },
+ * }} Rule
+ */
+
+const FRAMES = /** @type {FrameType[]} */ (["main_frame", "sub_frame"]);
+const REDDIT = String.raw`^https?://([a-z0-9-]+\.)*reddit\.com`;
+const END = String.raw`([/?#]|$)`;
+
+/** Used when nothing has been heard from `focus` yet: block everything but the fixed exceptions. */
+export const UNKNOWN_POLICY = /** @type {Policy} */ ({ state: "on", allow: [] });
+
+/**
+ * @param {Policy} policy
+ * @returns {Rule[]}
+ */
+export function buildRules(policy) {
+  if (policy.state !== "on") return [];
+  /** @type {Rule[]} */
+  const rules = [
+    // Every Reddit page and frame, on reddit.com and all of its subdomains.
+    rule(1, 1, "block", { requestDomains: ["reddit.com"] }),
+    // Signing in, and Reddit's redirector for links to other sites.
+    rule(2, 2, "allow", { regexFilter: `${REDDIT}/(login|register|logout)${END}` }),
+    rule(3, 2, "allow", { regexFilter: String.raw`^https?://out\.reddit\.com/` }),
+    // redd.it/<id> redirects here; comments.js checks which subreddit the post is in.
+    rule(4, 2, "allow", { regexFilter: `${REDDIT}/comments/[a-z0-9]+${END}` }, ["main_frame"]),
+    // A subreddit's search can search all of Reddit (restrict_sr=off), so it stays blocked.
+    rule(5, 3, "block", { regexFilter: `${REDDIT}/r/[^/?#]+/search${END}` }),
+  ];
+  policy.allow.forEach((name, index) => {
+    rules.push(rule(100 + index, 2, "allow", { regexFilter: `${REDDIT}/r/${name}${END}` }));
+  });
+  return rules;
+}
+
+/**
+ * @param {number} id
+ * @param {number} priority
+ * @param {"allow" | "block"} type
+ * @param {{ regexFilter?: string, requestDomains?: string[] }} match
+ * @param {FrameType[]} resourceTypes
+ * @returns {Rule}
+ */
+function rule(id, priority, type, match, resourceTypes = FRAMES) {
+  return { id, priority, action: { type }, condition: { ...match, resourceTypes } };
+}
+
+/**
+ * What Chrome would do with a request: the highest-priority matching rule wins,
+ * and at equal priority allow beats block. Returns null when no rule matches.
+ * Regexes are case-insensitive, like DNR's default.
+ *
+ * @param {Rule[]} rules
+ * @param {string} url
+ * @param {FrameType} resourceType
+ * @returns {"allow" | "block" | null}
+ */
+export function evaluate(rules, url, resourceType = "main_frame") {
+  let host;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return null;
+  }
+  /** @type {Rule | null} */
+  let winner = null;
+  for (const candidate of rules) {
+    const { condition } = candidate;
+    if (!condition.resourceTypes.includes(resourceType)) continue;
+    if (condition.requestDomains && !condition.requestDomains.some((d) => host === d || host.endsWith(`.${d}`))) {
+      continue;
+    }
+    if (condition.regexFilter && !new RegExp(condition.regexFilter, "i").test(url)) continue;
+    if (
+      !winner ||
+      candidate.priority > winner.priority ||
+      (candidate.priority === winner.priority && candidate.action.type === "allow")
+    ) {
+      winner = candidate;
+    }
+  }
+  return winner ? winner.action.type : null;
+}
+
+/**
+ * @param {Policy} policy
+ * @param {string} url
+ */
+export function isAllowed(policy, url) {
+  return evaluate(buildRules(policy), url) !== "block";
+}
+
+/**
+ * Whether a page may stay open. A bare /comments/<id> URL doesn't say which subreddit
+ * the post is in, so for those the page's own report (from comments.js) decides.
+ *
+ * @param {Policy} policy
+ * @param {string} url
+ * @param {string | null} subreddit the subreddit a bare comments page reported, if any
+ */
+export function mayStay(policy, url, subreddit = null) {
+  if (!isAllowed(policy, url)) return false;
+  if (policy.state !== "on" || !isBareComments(url)) return true;
+  return subreddit !== null && policy.allow.includes(subreddit.toLowerCase());
+}
+
+/** @param {string} url */
+export function isBareComments(url) {
+  try {
+    return /^\/comments\/[a-z0-9]+([/?#]|$)/i.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The subreddit a URL is in, lowercased, or null.
+ * @param {string} url
+ */
+export function subredditOf(url) {
+  try {
+    return /^\/r\/([^/?#]+)/i.exec(new URL(url).pathname)?.[1]?.toLowerCase() ?? null;
+  } catch {
+    return null;
+  }
+}

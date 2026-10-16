@@ -9,12 +9,13 @@
   },
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsc --noEmit",
-    "build": "bun build --compile src/cli.ts --outfile dist/focus && codesign --sign - --force dist/focus",
+    "typecheck": "tsc --noEmit && tsc -p extension --noEmit",
+    "build": "bun build --compile src/cli.ts --asset ./extension --outfile dist/focus && codesign --sign - --force dist/focus",
     "build:release": "bun scripts/build-release.ts"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "@types/chrome": "^0.3.5"
   },
   "peerDependencies": {
     "typescript": "^7"
