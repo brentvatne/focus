@@ -53,15 +53,23 @@ describe("allowlist file", () => {
   });
 
   test("reads as empty when missing", async () => {
-    expect(await readAllowlist(join(dir, "nope.json"))).toEqual({ path: join(dir, "nope.json"), found: false, allow: [] });
+    expect(await readAllowlist(join(dir, "nope.json"))).toEqual({ path: join(dir, "nope.json"), found: false, enabled: false, allow: [] });
   });
 
   test("round-trips, creating missing folders", async () => {
     const path = join(dir, "a", "b", "subreddits.json");
     await writeAllowlist(path, ["rust", "de"]);
-    expect(await readAllowlist(path)).toEqual({ path, found: true, allow: ["rust", "de"] });
+    expect(await readAllowlist(path)).toEqual({ path, found: true, enabled: true, allow: ["rust", "de"] });
     expect(await Bun.file(path).text()).toBe('{\n  "version": 1,\n  "allow": [\n    "rust",\n    "de"\n  ]\n}\n');
     expect((await stat(path)).mode & 0o777).toBe(0o644);
+  });
+
+  test("switching it off keeps the list", async () => {
+    const path = join(dir, "subreddits.json");
+    await writeAllowlist(path, ["rust"], false);
+    expect(await readAllowlist(path)).toEqual({ path, found: true, enabled: false, allow: ["rust"] });
+    await Bun.write(path, '{"version":1,"enabled":"no","allow":[]}');
+    await expect(readAllowlist(path)).rejects.toThrow("'enabled' must be true or false");
   });
 
   test.each([

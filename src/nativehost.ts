@@ -110,7 +110,7 @@ export async function respond(request: unknown, deps: NativeHostDeps): Promise<S
   // Separate from the state, so a bad allowlist can't stop `focus off` from turning the extension off.
   try {
     const list = await readAllowlist(deps.allowlistPath);
-    reply.reddit = list.found;
+    reply.reddit = list.found && list.enabled;
     reply.allow = list.allow;
   } catch (error) {
     reply.reddit = true;

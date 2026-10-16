@@ -57,6 +57,8 @@ export function normalizeSubreddit(input: string): string {
 export interface Allowlist {
   path: string;
   found: boolean;
+  /** False when Reddit restriction is switched off in `focus config`; the list is kept for later. */
+  enabled: boolean;
   allow: string[];
 }
 
@@ -71,7 +73,7 @@ export async function readAllowlist(path: string): Promise<Allowlist> {
       await handle.close();
     }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, found: false, allow: [] };
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, found: false, enabled: false, allow: [] };
     throw error;
   }
 
@@ -85,11 +87,12 @@ export async function readAllowlist(path: string): Promise<Allowlist> {
     throw new SubredditError(`${path}: expected a JSON object`);
   }
   for (const key of Object.keys(raw)) {
-    if (key !== "version" && key !== "allow") {
-      throw new SubredditError(`${path}: unknown key '${key}' (expected version and allow)`);
+    if (key !== "version" && key !== "enabled" && key !== "allow") {
+      throw new SubredditError(`${path}: unknown key '${key}' (expected version, enabled and allow)`);
     }
   }
-  const { version, allow } = raw as { version?: unknown; allow?: unknown };
+  const { version, enabled, allow } = raw as { version?: unknown; enabled?: unknown; allow?: unknown };
+  if (enabled !== undefined && typeof enabled !== "boolean") throw new SubredditError(`${path}: 'enabled' must be true or false`);
   if (version !== 1) throw new SubredditError(`${path}: unsupported version ${JSON.stringify(version)}`);
   if (!Array.isArray(allow) || !allow.every((name) => typeof name === "string")) {
     throw new SubredditError(`${path}: 'allow' must be a list of subreddit names`);
@@ -106,14 +109,16 @@ export async function readAllowlist(path: string): Promise<Allowlist> {
   if (allow.length > MAX_SUBREDDITS) {
     throw new SubredditError(`${path}: more than ${MAX_SUBREDDITS} subreddits`);
   }
-  return { path, found: true, allow: [...new Set(allow as string[])] };
+  return { path, found: true, enabled: enabled !== false, allow: [...new Set(allow as string[])] };
 }
 
-export async function writeAllowlist(path: string, allow: string[]): Promise<void> {
+/** Writes the list; `enabled: false` keeps it but stops Chrome restricting Reddit. */
+export async function writeAllowlist(path: string, allow: string[], enabled = true): Promise<void> {
   if (allow.length > MAX_SUBREDDITS) {
     throw new SubredditError(`focus allows at most ${MAX_SUBREDDITS} subreddits`);
   }
   await mkdir(dirname(path), { recursive: true });
-  const content = JSON.stringify({ version: 1, allow }, null, 2) + "\n";
+  // "enabled" is only written when off, so the file stays readable by focus 0.2 and earlier otherwise.
+  const content = JSON.stringify(enabled ? { version: 1, allow } : { version: 1, enabled: false, allow }, null, 2) + "\n";
   await writeAtomically(path, content, { mode: 0o644, uid: process.getuid!(), gid: process.getgid!() });
 }

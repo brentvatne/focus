@@ -7,6 +7,7 @@ import {
   type LoadedExtension,
   defaultChromePaths,
   findLoadedExtension,
+  installedExtensionVersion,
   isDirectory,
   readExtensionId,
   removeChromeFiles,
@@ -42,7 +43,7 @@ import {
   syncSection,
   withPresets,
 } from "./presets.ts";
-import { promptForPresets } from "./prompt.ts";
+import { type Choice, askText, chooseOptions } from "./prompt.ts";
 import {
   MAX_SUBREDDITS,
   SubredditError,
@@ -62,8 +63,9 @@ Block distracting websites by managing a marked section of /etc/hosts.
 
 Commands:
   (none)                  Toggle blocking: on if it's off, off if it's on
-  init [preset...]      Choose which presets to block. Without names, shows a checklist;
-                          names set the list exactly. Presets: ${PRESETS.map((p) => p.id).join(", ")}
+  init [preset...]        Set focus up: a checklist of what to block. Names set the presets
+                          exactly instead. Presets: ${PRESETS.map((p) => p.id).join(", ")}
+  config                  Change what's blocked: whole sites, and the Chrome options below
   add <host|preset...>    Block hostnames (and www.<host> unless --exact), or turn presets on
   remove <host|preset...> Unblock hostnames (and www.<host> unless --exact), or turn presets off
   on                      Turn blocking on for everything listed
@@ -77,7 +79,8 @@ Commands:
   reddit disallow <name...>
                           Take subreddits off that list
   reddit list             Show the allowed subreddits
-  chrome install          Set up the Chrome extension that does the above (uninstall removes it)
+  chrome install          Set up the Chrome extension that does the above (uninstall removes it;
+                          update brings its files up to date, which upgrade does for you)
   upgrade                 Install the latest release, then sync (--dry-run only checks)
   setup-sudo              Let focus get root without a password (--remove undoes it)
   version                 Print the version
@@ -118,8 +121,10 @@ export interface Io {
   readKey(): { key: Promise<Key>; stop(): void };
   /** Called after /etc/hosts itself (never any other file) has been rewritten. */
   flushDns(): Promise<void>;
-  /** Asks which presets to block; resolves to their ids, or null if cancelled. Absent without a terminal. */
-  selectPresets?(presets: Preset[], initial: string[]): Promise<string[] | null>;
+  /** A grouped checklist for `config` and `init`; the checked values, or null if cancelled. Absent without a terminal. */
+  choose?(message: string, groups: Record<string, Choice[]>, initial: string[]): Promise<string[] | null>;
+  /** One line of text, or null if cancelled. Absent without a terminal. */
+  askText?(message: string, placeholder: string): Promise<string | null>;
   upgrade(dryRun: boolean, progress: (event: UpgradeProgress) => void): Promise<UpgradeResult>;
   /** Runs a binary with the given arguments and this process's stdio; resolves to its exit code. */
   runBinary(path: string, args: string[]): Promise<number>;
@@ -206,7 +211,10 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
         io.stdout(formatUpgrade(check));
         return 0;
       }
-      return elevate(argv, io);
+      const code = await elevate(argv, io);
+      // As the user, not root: the extension's folder is theirs.
+      if (code === 0) await updateExtensionAfterUpgrade(await realpath(io.binaryPath), io);
+      return code;
     }
     const status = statusLine(io);
     const result = await io
@@ -225,6 +233,7 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
       io.stderr("focus: the upgrade succeeded but syncing presets failed; run `focus sync`\n");
       return 1;
     }
+    if (!io.isRoot) await updateExtensionAfterUpgrade(result.path, io);
     return 0;
   }
 
@@ -248,6 +257,8 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
     // The allowlist, the feeds and Chrome's files are the user's; root never touches them.
     if (io.isRoot) throw new UsageError(`run \`focus ${command}\` as yourself, not with sudo; it never needs root`);
     if (values["dry-run"]) throw new UsageError(`--dry-run doesn't apply to focus ${command}`);
+    // Keep the extension's files at this version. install, update and uninstall see to the files themselves.
+    if (command !== "chrome" && !["install", "uninstall"].includes(args[0] ?? "")) await updateExtensionFiles(io);
     const hostsArgs = [
       ...(values["hosts-file"] ? ["--hosts-file", values["hosts-file"]] : []),
       ...(values.flush === undefined ? [] : [values.flush ? "--flush" : "--no-flush"]),
@@ -255,6 +266,16 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
     if (command === "feeds") return feeds(args, hostsPath, hostsArgs, io);
     if (command === "chrome") return chrome(args, hostsPath, null, io);
     return reddit(args, hostsPath, hostsArgs, io);
+  }
+  // The checklists run as you; whatever needs root is re-run through sudo once you've chosen.
+  if (command === "config" || (command === "init" && args.length === 0 && !values.yes && io.choose)) {
+    if (command === "config" && args.length > 0) throw new UsageError("config takes no arguments");
+    const passthrough = [
+      ...(values["hosts-file"] ? ["--hosts-file", values["hosts-file"]] : []),
+      ...(values.flush === undefined ? [] : [values.flush ? "--flush" : "--no-flush"]),
+      ...(values["dry-run"] ? ["--dry-run"] : []),
+    ];
+    return configure(command, hostsPath, passthrough, values["dry-run"] ?? false, io);
   }
   // A bare `focus` with nothing to toggle shows help instead of asking sudo for nothing.
   if (command === undefined && !readSection((await readHostsFile(hostsPath)).content)) {
@@ -295,12 +316,7 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
 
   let next: FocusSection | null;
   if (command === "init") {
-    const ids = await choosePresets(args, values.yes ?? false, current, io);
-    if (ids === null) {
-      io.stdout("Cancelled; nothing was changed.\n");
-      return 0;
-    }
-    next = withPresets(current, ids);
+    next = withPresets(current, choosePresets(args, values.yes ?? false, current));
   } else {
     next = planChange(command, args, current, { exact, preset: values.preset ?? false }, io);
   }
@@ -447,7 +463,7 @@ async function feeds(args: string[], hostsPath: string, hostsArgs: string[], io:
       if (added.length > 0) {
         await writeFeeds(path, [...current, ...added.map((site) => site.id)]);
         const s = styles(io.color);
-        for (const site of added) io.stdout(`${s.green("✓")} ${site.name}: in Chrome, focus blocks ${site.what}\n`);
+        for (const site of added) io.stdout(`${s.green("✓")} ${site.name}: ${site.mode}, in Chrome ${s.dim(`(${site.keeps})`)}\n`);
       }
       return afterChromeChange(requested.map((site) => site.preset), hostsPath, hostsArgs, io);
     }
@@ -522,6 +538,15 @@ async function chrome(args: string[], hostsPath: string, purpose: "reddit" | nul
       await finishChromeSetup(id, hostsPath, purpose, io);
       return 0;
     }
+    case "update": {
+      if (rest.length > 0) throw new UsageError(`${command} takes no arguments`);
+      if (!(await isDirectory(io.chrome.extensionDir))) {
+        io.stderr("focus: the Chrome extension isn't set up; run `focus chrome install`\n");
+        return 1;
+      }
+      if (!(await updateExtensionFiles(io))) io.stdout(`The Chrome extension's files are up to date (${VERSION}).\n`);
+      return 0;
+    }
     case "uninstall": {
       if (rest.length > 0) throw new UsageError(`${command} takes no arguments`);
       // Read before removing the folder: its manifest has the id.
@@ -534,8 +559,9 @@ async function chrome(args: string[], hostsPath: string, purpose: "reddit" | nul
           `Your settings stay in ${tildify(io.chrome.allowlistPath, home)} and ${tildify(io.chrome.feedsPath, home)}.\n` +
           "To block whole sites again: focus add reddit youtube x\n",
       );
-      if (loaded.length > 0 && id !== null) {
-        io.stdout(`\nChrome still lists the focus extension (${profileNames(loaded)}); click Remove on its details page, chrome://extensions/?id=${id}.\n`);
+      if (loaded?.length !== 0 && id !== null) {
+        const where = loaded ? `Chrome still lists the focus extension (${profileNames(loaded)})` : "If Chrome still lists the focus extension";
+        io.stdout(`\n${where}; click Remove on its details page, chrome://extensions/?id=${id}.\n`);
         if (io.stdoutIsTerminal && io.stderrIsTerminal && (await confirm("Press Enter to open it", io))) {
           await io.chrome.openInChrome(`chrome://extensions/?id=${id}`).catch(() => false);
         }
@@ -544,9 +570,27 @@ async function chrome(args: string[], hostsPath: string, purpose: "reddit" | nul
     }
     default:
       throw new UsageError(
-        subcommand ? `unknown chrome command '${subcommand}'` : "focus chrome needs a command: install or uninstall",
+        subcommand ? `unknown chrome command '${subcommand}'` : "focus chrome needs a command: install, update or uninstall",
       );
   }
+}
+
+/**
+ * Brings the extension's folder up to this version if it's from another one, and says so.
+ * A loaded extension then reloads itself the next time it checks in with focus; one Chrome
+ * hasn't loaded yet gets the current files when it is. Only the installed binary does this,
+ * so running from source never rewrites the real folder. Resolves whether it wrote anything.
+ */
+async function updateExtensionFiles(io: Io): Promise<boolean> {
+  if (!io.binaryPath || !(await isDirectory(io.chrome.extensionDir))) return false;
+  const installed = await installedExtensionVersion(io.chrome.extensionDir);
+  if (installed === VERSION) return false;
+  await writeExtension(io.chrome.extensionSource, io.chrome.extensionDir, VERSION);
+  io.stdout(
+    `Updated the Chrome extension's files${installed ? ` from ${installed}` : ""} to ${VERSION}. ` +
+      "Chrome reloads it the next time it checks in with focus, when you next open Reddit, YouTube or X.\n",
+  );
+  return true;
 }
 
 /**
@@ -561,7 +605,7 @@ async function afterChromeChange(presetIds: string[], hostsPath: string, hostsAr
   }
   if (!(await isDirectory(io.chrome.extensionDir))) {
     io.stderr("focus: the Chrome extension isn't set up yet; run `focus chrome install`\n");
-  } else if ((await chromeProfiles(io)).length === 0) {
+  } else if ((await chromeProfiles(io))?.length === 0) {
     io.stderr("focus: Chrome hasn't loaded the extension yet; run `focus chrome install` to finish setting it up\n");
   }
   const blocking = (section?.presets ?? []).map((group) => group.id).filter((id) => presetIds.includes(id));
@@ -597,6 +641,134 @@ function parseSubreddits(args: string[], command: string): string[] {
 }
 
 /** Points out the two setups in which the allowlist does nothing. */
+const REDDIT_CHOICE = "reddit:subreddits";
+
+/**
+ * `focus config`, and `focus init` as its first-run version: one checklist of everything focus
+ * can block, starting from what's set now (or, for a first `init`, the recommended presets).
+ * Chrome settings are written as you; the hosts file changes through `init` or `remove`, so
+ * through sudo as usual. Root gets only the presets: the Chrome settings are your files.
+ */
+async function configure(kind: "config" | "init", hostsPath: string, passthrough: string[], dryRun: boolean, io: Io): Promise<number> {
+  if (!io.choose) {
+    throw new UsageError("config needs an interactive terminal; use add, remove, feeds and reddit instead");
+  }
+  const s = styles(io.color);
+  const section = readSection((await readHostsFile(hostsPath)).content);
+  const synced = section ? syncSection(section) : null;
+  const currentPresets = synced?.presets.map((group) => group.id) ?? [];
+  const chromeSettings = !io.isRoot;
+  const feedIds = chromeSettings ? await readFeeds(io.chrome.feedsPath) : [];
+  const list = chromeSettings ? await readAllowlist(io.chrome.allowlistPath) : null;
+  const redditOn = list !== null && list.found && list.enabled;
+
+  const firstRun = kind === "init" && currentPresets.length === 0 && (!synced || isEmpty(synced)) && feedIds.length === 0 && !list?.found;
+  const initial = firstRun
+    ? recommendedPresets()
+    : [...currentPresets, ...feedIds.map((id) => `feed:${id}`), ...(redditOn ? [REDDIT_CHOICE] : [])];
+
+  const groups: Record<string, Choice[]> = {
+    "Block the whole site": PRESETS.map((preset) => ({ value: preset.id, label: preset.name, hint: preset.note })),
+  };
+  if (chromeSettings) {
+    groups["Or, in Chrome, just part of it"] = [
+      ...FEED_SITES.map((site) => ({ value: `feed:${site.id}`, label: `${site.name}: ${site.mode}`, hint: site.keeps })),
+      { value: REDDIT_CHOICE, label: "Reddit: chosen subreddits only", hint: "every other subreddit is blocked" },
+    ];
+  }
+
+  if (kind === "init") {
+    io.stdout(
+      `${s.bold("focus")} blocks distracting sites while it's on. Choose what to block; change it any time with \`focus config\`.\n` +
+        (chromeSettings ? "" : "Running as root, so only whole sites are offered; run it without sudo for the Chrome options.\n") +
+        "\n",
+    );
+  }
+  const chosen = await io.choose(kind === "init" ? "What should focus block?" : "What should focus block? Space toggles, Enter saves.", groups, initial);
+  if (chosen === null) {
+    io.stdout("Cancelled; nothing was changed.\n");
+    return 0;
+  }
+  const nextPresets = PRESETS.map((preset) => preset.id).filter((id) => chosen.includes(id));
+  const nextFeeds = FEED_SITES.map((site) => site.id).filter((id) => chosen.includes(`feed:${id}`));
+  const nextReddit = chosen.includes(REDDIT_CHOICE);
+  const done = (text: string) => io.stdout(`${s.green("✓")} ${text}\n`);
+  const dry = dryRun ? " (dry run: not saved)" : "";
+
+  // The Chrome settings: your files, written as you.
+  if (chromeSettings && list) {
+    if (nextFeeds.join() !== feedIds.join()) {
+      if (!dryRun) await writeFeeds(io.chrome.feedsPath, nextFeeds);
+      for (const id of nextFeeds.filter((id) => !feedIds.includes(id))) {
+        const site = findFeedSite(id)!;
+        done(`${site.name}: ${site.mode}, in Chrome ${s.dim(`(${site.keeps})`)}${dry}`);
+      }
+      for (const id of feedIds.filter((id) => !nextFeeds.includes(id))) done(`${findFeedSite(id)!.name}: no longer restricted in Chrome${dry}`);
+    }
+    if (nextReddit !== redditOn) {
+      let allow = list.allow;
+      if (nextReddit && allow.length === 0) {
+        const answer = io.askText
+          ? await io.askText("Which subreddits should load? Separate them with spaces.", "rust AskHistorians")
+          : null;
+        if (answer === null) {
+          io.stdout("Cancelled; nothing else was changed.\n");
+          return 0;
+        }
+        allow = answer.trim() === "" ? [] : parseSubreddits(answer.trim().split(/[\s,]+/), "config");
+      }
+      if (!dryRun) await writeAllowlist(io.chrome.allowlistPath, allow, nextReddit);
+      done(
+        nextReddit
+          ? `Reddit: only ${allow.length > 0 ? allow.map((name) => `r/${name}`).join(", ") : "the subreddits you allow (none yet; add them with `focus reddit allow`)"}, in Chrome${dry}`
+          : `Reddit: no longer restricted in Chrome; your list is kept${dry}`,
+      );
+    }
+    // Both checked: the hosts file wins, so say the finer setting waits.
+    const shadowed = [
+      ...nextFeeds.filter((id) => nextPresets.includes(findFeedSite(id)!.preset)).map((id) => findFeedSite(id)!.name),
+      ...(nextReddit && nextPresets.includes("reddit") ? ["Reddit"] : []),
+    ];
+    if (shadowed.length > 0) {
+      io.stdout(`  ${s.dim(`${shadowed.join(" and ")}: the whole site is blocked, so the Chrome setting does nothing until you uncheck the whole site.`)}\n`);
+    }
+  }
+
+  // The hosts file: through `init` (exactly these presets) or, for none at all, `remove`.
+  let code = 0;
+  if (nextPresets.join() !== currentPresets.join()) {
+    const change = nextPresets.length > 0 ? ["init", ...nextPresets] : ["remove", ...currentPresets];
+    code = await runCommand([...change, ...passthrough], io);
+  } else if (nextFeeds.join() === feedIds.join() && nextReddit === redditOn) {
+    io.stdout("No changes.\n");
+  }
+
+  // The Chrome options need the extension.
+  if (code === 0 && chromeSettings && !dryRun && (nextFeeds.length > 0 || nextReddit)) {
+    const installed = await isDirectory(io.chrome.extensionDir);
+    const loaded = installed ? await chromeProfiles(io) : [];
+    if (!installed || loaded?.length === 0) {
+      io.stdout(`\nThe Chrome options need the focus extension, which Chrome hasn't loaded yet.\n`);
+      if (io.binaryPath && io.stdoutIsTerminal && io.stderrIsTerminal && (await confirm("Press Enter to set it up now", io))) {
+        io.stdout("\n");
+        code = await chrome(["install"], hostsPath, null, io);
+      } else {
+        io.stdout("Set it up with: focus chrome install\n");
+      }
+    }
+  }
+
+  if (kind === "init" && code === 0 && !dryRun) {
+    io.stdout(
+      `\n${s.bold("Next")}\n` +
+        `  focus             ${s.dim("turn blocking off for a break, and on again")}\n` +
+        `  focus config      ${s.dim("change what's blocked")}\n` +
+        `  focus setup-sudo  ${s.dim("stop asking for your password")}\n`,
+    );
+  }
+  return code;
+}
+
 const GUIDE_URL = "https://github.com/brentvatne/focus/blob/main/docs/guide.md#finer-blocking-in-chrome";
 /** How long `chrome install` waits for each step in Chrome before giving up. */
 const CHROME_WAIT_MS = 10 * 60 * 1000;
@@ -618,7 +790,9 @@ async function finishChromeSetup(id: string, hostsPath: string, purpose: "reddit
   done(`Wrote the extension to ${hyperlink(shortPath, fileUrl(extensionDir), links)}`);
   done("Registered focus with Chrome");
 
-  let loaded = await find();
+  // Null when Chrome's profiles can't be read: the steps still print, but nothing can wait for them.
+  const initial = await find();
+  let loaded = initial ?? [];
   if (loaded.length > 0) {
     done(`Chrome already has it loaded (${profileNames(loaded)})`);
   } else {
@@ -635,12 +809,16 @@ async function finishChromeSetup(id: string, hostsPath: string, purpose: "reddit
       const copied = await io.chrome.copyToClipboard(extensionDir).catch(() => false);
       if (!opened) io.stdout(`  Chrome didn't open; open chrome://extensions in Google Chrome yourself.\n`);
       if (!copied) io.stdout(`  Couldn't copy the path; it's ${shortPath}\n`);
-      loaded =
-        (await waitForChrome("Waiting for Chrome to load it", io, async () => {
-          const found = await find();
-          return found.length > 0 ? found : null;
-        })) ?? [];
-      if (loaded.length > 0) done(`Chrome loaded it (${profileNames(loaded)})`);
+      if (initial === null) {
+        io.stdout(`  focus ${CANT_SEE_CHROME}, so it can't wait for you; run \`focus status\` afterwards.\n`);
+      } else {
+        loaded =
+          (await waitForChrome("Waiting for Chrome to load it", io, async () => {
+            const found = await find();
+            return found && found.length > 0 ? found : null;
+          })) ?? [];
+        if (loaded.length > 0) done(`Chrome loaded it (${profileNames(loaded)})`);
+      }
     }
   }
 
@@ -654,7 +832,7 @@ async function finishChromeSetup(id: string, hostsPath: string, purpose: "reddit
         io.stdout(`  Chrome didn't open; go to chrome://extensions/?id=${id} yourself.\n`);
       }
       const allowed = await waitForChrome("Waiting for Incognito access", io, async () =>
-        (await find()).some((profile) => profile.incognito) ? true : null,
+        (await find())?.some((profile) => profile.incognito) ? true : null,
       );
       if (allowed) done("Allowed in Incognito");
     }
@@ -668,7 +846,7 @@ async function finishChromeSetup(id: string, hostsPath: string, purpose: "reddit
     steps.push(["focus reddit allow <name...>", purpose === "reddit" ? "choose the subreddits to keep" : "limit Reddit to chosen subreddits"]);
   }
   // Presets that block a site whole, while Chrome is set to restrict only part of it.
-  const restricted = [...(purpose === "reddit" || list.found ? ["reddit"] : []), ...feedIds];
+  const restricted = [...(purpose === "reddit" || (list.found && list.enabled) ? ["reddit"] : []), ...feedIds];
   const section = readSection((await readHostsFile(hostsPath)).content);
   const blocking = (section?.presets ?? []).map((group) => group.id).filter((preset) => restricted.includes(preset));
   if (blocking.length > 0) {
@@ -732,15 +910,19 @@ function tildify(path: string, home: string | undefined): string {
   return home && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
 }
 
-async function chromeProfiles(io: Io): Promise<LoadedExtension[]> {
+/** Where Chrome has the installed extension loaded; null if Chrome's profiles can't be read. */
+async function chromeProfiles(io: Io): Promise<LoadedExtension[] | null> {
   const id = await readExtensionId(io.chrome.extensionDir).catch(() => null);
   return id ? findLoadedExtension(io.chrome.profilesDir, id, io.chrome.extensionDir) : [];
 }
+
+const CANT_SEE_CHROME = "couldn't check whether Chrome has it loaded (no access to Chrome's profile files)";
 
 /** The status line for the extension, once it's been installed. */
 async function formatExtension(io: Io): Promise<string> {
   if (!(await isDirectory(io.chrome.extensionDir))) return "";
   const loaded = await chromeProfiles(io);
+  if (loaded === null) return `Extension:  set up; ${CANT_SEE_CHROME}\n`;
   if (loaded.length === 0) return "Extension:  not loaded in Chrome; run `focus chrome install` to finish\n";
   const incognito = loaded.some((profile) => profile.incognito) ? "allowed in Incognito" : "not allowed in Incognito";
   return `Extension:  loaded in Chrome (${profileNames(loaded)}), ${incognito}\n`;
@@ -751,25 +933,25 @@ async function formatFeeds(path: string, section: FocusSection | null): Promise<
   try {
     ids = await readFeeds(path);
   } catch (error) {
-    return `Feeds:      ${describeError(error)}\n`;
+    return `In Chrome:  ${describeError(error)}\n`;
   }
   if (ids.length === 0) return "";
   const enabled = section?.presets.map((group) => group.id) ?? [];
   const shadowed = ids.filter((id) => enabled.includes(findFeedSite(id)!.preset)).map((id) => findFeedSite(id)!.name);
   const note = shadowed.length > 0 ? `\n            (no effect for ${shadowed.join(", ")}: the hosts file blocks the whole site)` : "";
-  return `Feeds:      ${ids.map((id) => findFeedSite(id)!.name).join(", ")} (only the feed is blocked, in Chrome)${note}\n`;
+  return `In Chrome:  ${ids.map((id) => `${findFeedSite(id)!.name} ${findFeedSite(id)!.mode}`).join(", ")}${note}\n`;
 }
 
 async function formatSubreddits(path: string, section: FocusSection | null): Promise<string> {
-  let allow: string[];
+  let list: Awaited<ReturnType<typeof readAllowlist>>;
   try {
-    const list = await readAllowlist(path);
+    list = await readAllowlist(path);
     if (!list.found) return "";
-    allow = list.allow;
   } catch (error) {
     return `Subreddits: ${describeError(error)}\n`;
   }
-  const names = allow.length > 0 ? allow.map((name) => `r/${name}`).join(", ") : "none";
+  const names = list.allow.length > 0 ? list.allow.map((name) => `r/${name}`).join(", ") : "none";
+  if (!list.enabled) return `Subreddits: ${names} (off; turn it on with \`focus config\`)\n`;
   const note = section && blocksReddit(section) ? "\n            (no effect: the hosts file blocks all of Reddit)" : "";
   return `Subreddits: ${names} (allowed in Chrome)${note}\n`;
 }
@@ -802,6 +984,14 @@ async function runNativeHost(io: Io): Promise<number> {
 async function isSameFile(a: string, b: string): Promise<boolean> {
   const [left, right] = await Promise.all([realpath(a).catch(() => a), realpath(b).catch(() => b)]);
   return left === right;
+}
+
+/** Has the new binary bring the extension's files up to its version, if the extension is set up. */
+async function updateExtensionAfterUpgrade(binary: string, io: Io): Promise<void> {
+  if (!(await isDirectory(io.chrome.extensionDir))) return;
+  if ((await io.runBinary(binary, ["chrome", "update"])) !== 0) {
+    io.stderr("focus: couldn't update the Chrome extension's files; run `focus chrome update`\n");
+  }
 }
 
 async function isWritable(path: string): Promise<boolean> {
@@ -888,21 +1078,17 @@ function offPresetsOwning(hosts: string[], section: FocusSection | null): Preset
   return PRESETS.filter((preset) => !enabled.has(preset.id) && hosts.some((host) => preset.hosts.includes(host)));
 }
 
-async function choosePresets(
-  args: string[],
-  yes: boolean,
-  current: FocusSection | null,
-  io: Io,
-): Promise<string[] | null> {
+/** The presets `init` sets without a checklist: the named ones, or with --yes the current (or recommended) ones. */
+function choosePresets(args: string[], yes: boolean, current: FocusSection | null): string[] {
   if (args.length > 0) return parsePresetIds(args, "init");
-  const initial = current?.presets.length
-    ? current.presets.map((group) => group.id)
-    : PRESETS.filter((preset) => preset.recommended).map((preset) => preset.id);
-  if (yes) return initial;
-  if (!io.selectPresets) {
+  if (!yes) {
     throw new UsageError("init needs an interactive terminal; name presets (e.g. `focus init x youtube`) or pass --yes");
   }
-  return io.selectPresets(PRESETS, initial);
+  return current?.presets.length ? current.presets.map((group) => group.id) : recommendedPresets();
+}
+
+function recommendedPresets(): string[] {
+  return PRESETS.filter((preset) => preset.recommended).map((preset) => preset.id);
 }
 
 function parsePresetIds(args: string[], command: string): string[] {
@@ -1151,7 +1337,8 @@ if (import.meta.main) {
       };
     },
     flushDns: flushMacDnsCache,
-    selectPresets: process.stdin.isTTY && process.stdout.isTTY ? promptForPresets : undefined,
+    choose: process.stdin.isTTY && process.stdout.isTTY ? chooseOptions : undefined,
+    askText: process.stdin.isTTY && process.stdout.isTTY ? askText : undefined,
     upgrade: (dryRun, progress) =>
       upgrade(VERSION, dryRun, {
         progress,

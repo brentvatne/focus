@@ -9,8 +9,30 @@ import { writeAtomically } from "./hostsfile.ts";
  * hosts-file preset that blocks the whole site instead.
  */
 export const FEED_SITES = [
-  { id: "youtube", name: "YouTube", preset: "youtube", what: "the home page, Shorts and Explore, and recommendations on video pages" },
-  { id: "x", name: "X", preset: "x", what: "the Home timeline, Explore, search and notifications" },
+  {
+    id: "youtube",
+    name: "YouTube",
+    preset: "youtube",
+    mode: "feed only",
+    keeps: "videos still work",
+    what: "the home page, Shorts and Explore, and recommendations on video pages",
+  },
+  {
+    id: "x",
+    name: "X",
+    preset: "x",
+    mode: "feed only",
+    keeps: "posts and profiles still work",
+    what: "the Home timeline, Explore, search and notifications",
+  },
+  {
+    id: "instagram",
+    name: "Instagram",
+    preset: "instagram",
+    mode: "messages only",
+    keeps: "everything else goes to your inbox",
+    what: "everything but your messages, sending other pages to your inbox",
+  },
 ] as const;
 
 export type FeedSiteId = (typeof FEED_SITES)[number]["id"];

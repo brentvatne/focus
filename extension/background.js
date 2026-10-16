@@ -4,6 +4,7 @@
 // binary (a one-shot native message, so nothing keeps running in between).
 import {
   BLOCKED_PAGES,
+  INSTAGRAM_INBOX,
   PROTOCOL,
   SITE_HOSTS,
   UNKNOWN_POLICY,
@@ -207,11 +208,15 @@ async function enforce(tabId, url, subreddit = null) {
   if (!tab || !stillOn(tab, url)) return;
   const query = subreddit ? `?subreddit=${encodeURIComponent(subreddit)}` : "";
   const site = siteOf(url);
-  const target = tab.incognito
-    ? isAllowed(await cachedPolicy(), url) && site
-      ? BLOCKED_PAGES[site]
-      : url
-    : chrome.runtime.getURL(`blocked.html${query}#${encodeURIComponent(url)}`);
+  // Instagram, limited to messages, always goes to the inbox rather than a blocked page.
+  const target =
+    site === "instagram"
+      ? INSTAGRAM_INBOX
+      : tab.incognito
+        ? isAllowed(await cachedPolicy(), url) && site
+          ? BLOCKED_PAGES[site]
+          : url
+        : chrome.runtime.getURL(`blocked.html${query}#${encodeURIComponent(url)}`);
   await chrome.tabs.update(tabId, { url: target }).catch(() => {});
 }
 

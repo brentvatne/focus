@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   BLOCKED_PAGES,
+  INSTAGRAM_INBOX,
   UNKNOWN_POLICY,
   buildRules,
   evaluate,
@@ -232,7 +233,55 @@ test("siteOf", () => {
   expect(siteOf("nope")).toBeNull();
 });
 
-test("each site's blocked page is blocked by that site's rules", () => {
-  const everything = { state: "on" as const, reddit: true, allow: ["rust"], feeds: ["youtube", "x"] };
-  for (const url of Object.values(BLOCKED_PAGES)) expect(isAllowed(everything, url)).toBe(false);
+test("each site's blocked page is blocked by that site's rules; Instagram's inbox is where it sends you", () => {
+  const everything = { state: "on" as const, reddit: true, allow: ["rust"], feeds: ["youtube", "x", "instagram"] };
+  const { instagram, ...blockedPages } = BLOCKED_PAGES;
+  for (const url of Object.values(blockedPages)) expect(isAllowed(everything, url)).toBe(false);
+  expect(isAllowed(everything, instagram)).toBe(true);
+});
+
+describe("Instagram, limited to messages", () => {
+  const policy = { state: "on" as const, reddit: false, allow: [] as string[], feeds: ["instagram"] };
+  const rules = buildRules(policy);
+
+  test.each([
+    "https://www.instagram.com/",
+    "https://instagram.com",
+    "https://www.instagram.com/explore/",
+    "https://www.instagram.com/reels/",
+    "https://www.instagram.com/p/abc123/",
+    "https://www.instagram.com/stories/someone/123/",
+    "https://www.instagram.com/someone/",
+    "https://www.instagram.com/directory/",
+  ])("sends %s to the inbox", (url) => {
+    expect(evaluate(rules, url)).toBe("redirect");
+    expect(isAllowed(policy, url)).toBe(false);
+  });
+
+  test.each([
+    "https://www.instagram.com/direct/inbox/",
+    "https://www.instagram.com/direct/t/123456/",
+    "https://www.instagram.com/direct",
+    "https://www.instagram.com/accounts/login/?next=%2Fdirect%2Finbox%2F",
+    "https://www.instagram.com/challenge/abc/",
+    "https://www.instagram.com/two_factor/",
+    "https://help.instagram.com/",
+    "https://about.instagram.com/",
+  ])("lets %s load", (url) => {
+    expect(isAllowed(policy, url)).toBe(true);
+  });
+
+  test("redirects only whole pages, so Instagram's own requests are untouched", () => {
+    expect(evaluate(rules, "https://www.instagram.com/explore/", "sub_frame")).toBeNull();
+    const redirect = rules.find((rule) => rule.action.type === "redirect")!;
+    expect(redirect.action).toEqual({ type: "redirect", redirect: { url: INSTAGRAM_INBOX } });
+    expect(redirect.condition.resourceTypes).toEqual(["main_frame"]);
+  });
+
+  test("evaluate ranks allow over block over redirect at the same priority", () => {
+    const same = (type: "allow" | "block") => ({ id: 1, priority: 1, action: { type }, condition: { regexFilter: "x", resourceTypes: ["main_frame" as const] } });
+    const redirect = { id: 2, priority: 1, action: { type: "redirect" as const, redirect: { url: "https://y/" } }, condition: { regexFilter: "x", resourceTypes: ["main_frame" as const] } };
+    expect(evaluate([redirect, same("block")], "https://x/")).toBe("block");
+    expect(evaluate([redirect, same("allow")], "https://x/")).toBe("allow");
+  });
 });

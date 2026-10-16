@@ -357,8 +357,8 @@ describe("init", () => {
   test("named presets replace the current ones and skip the prompt", async () => {
     await focus("init", "--yes");
     let prompted = false;
-    const selectPresets = async () => ((prompted = true), []);
-    expect((await focusWith({ selectPresets }, "init", "messenger", "Reddit")).code).toBe(0);
+    const choose = async () => ((prompted = true), []);
+    expect((await focusWith({ choose }, "init", "messenger", "Reddit")).code).toBe(0);
     expect(prompted).toBe(false);
     expect(await presetsLine()).toBe("Presets:    Reddit, Messenger");
     expect(await read()).not.toContain("facebook.com");
@@ -368,8 +368,8 @@ describe("init", () => {
     await focus("init", "x", "youtube");
     await focus("add", "a.com");
     let initial: string[] = [];
-    const selectPresets = async (_: unknown, current: string[]) => ((initial = current), ["youtube", "hackernews"]);
-    expect((await focusWith({ selectPresets }, "init")).code).toBe(0);
+    const choose = async (_: string, __: unknown, current: string[]) => ((initial = current), ["youtube", "hackernews"]);
+    expect((await focusWith({ choose }, "init")).code).toBe(0);
     expect(initial).toEqual(["x", "youtube"]);
     expect(await presetsLine()).toBe("Presets:    YouTube, Hacker News");
     expect(await read()).not.toContain("x.com");
@@ -378,18 +378,18 @@ describe("init", () => {
 
   test("the checklist starts from the recommended presets on a fresh install", async () => {
     let initial: string[] = [];
-    await focusWith({ selectPresets: async (_: unknown, current: string[]) => ((initial = current), null) }, "init");
+    await focusWith({ choose: async (_: string, __: unknown, current: string[]) => ((initial = current), null) }, "init");
     expect(initial).toEqual(["x", "facebook", "youtube", "reddit"]);
   });
 
   test("unchecking every preset restores the original file", async () => {
     await focus("init", "--yes");
-    expect((await focusWith({ selectPresets: async () => [] }, "init")).code).toBe(0);
+    expect((await focusWith({ choose: async () => [] }, "init")).code).toBe(0);
     expect(await read()).toBe(ORIGINAL);
   });
 
   test("cancelling the prompt changes nothing", async () => {
-    const result = await focusWith({ selectPresets: async () => null }, "init");
+    const result = await focusWith({ choose: async () => null }, "init");
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("Cancelled");
     expect(await read()).toBe(ORIGINAL);
@@ -604,6 +604,21 @@ describe("version and upgrade", () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("Upgraded focus 0.1.0 -> 0.2.0");
     expect(calls).toEqual([["/usr/local/bin/focus", ["sync"]]]);
+  });
+
+  test("updates the Chrome extension's files with the new binary, when it's set up", async () => {
+    const calls: string[][] = [];
+    const runBinary = async (_: string, args: string[]) => (calls.push(args), 0);
+    await focusWith({ upgrade: upgraded, runBinary }, "upgrade");
+    expect(calls).toEqual([["sync"]]);
+    await mkdir(join(dir, "chrome-extension"));
+    calls.length = 0;
+    await focusWith({ upgrade: upgraded, runBinary }, "upgrade");
+    expect(calls).toEqual([["sync"], ["chrome", "update"]]);
+    calls.length = 0;
+    // As root (sudo focus upgrade), the user's files are left alone.
+    await focusWith({ upgrade: upgraded, runBinary, isRoot: true, systemHostsFile: hostsFile }, "upgrade");
+    expect(calls).toEqual([["sync"]]);
   });
 
   test("passes --hosts-file and --no-flush on to the sync", async () => {
@@ -1217,13 +1232,14 @@ describe("reddit", () => {
   });
 
   const feedsFile = () => join(dir, "feeds.json");
+  const presetsLineOf = async () => (await focus("status")).stdout.split("\n").find((line) => line.startsWith("Presets:"));
 
   test("feeds add, list and remove edit only the feeds file", async () => {
     const before = await read();
     const added = await focus("feeds", "add", "YouTube", "x");
     expect(added.code).toBe(0);
-    expect(added.stdout).toContain("✓ YouTube: in Chrome, focus blocks the home page, Shorts and Explore, and recommendations on video pages\n");
-    expect(added.stdout).toContain("✓ X: in Chrome, focus blocks the Home timeline, Explore, search and notifications\n");
+    expect(added.stdout).toContain("✓ YouTube: feed only, in Chrome (videos still work)\n");
+    expect(added.stdout).toContain("✓ X: feed only, in Chrome (posts and profiles still work)\n");
     expect(await Bun.file(feedsFile()).json()).toEqual({ version: 1, feeds: ["youtube", "x"] });
     expect((await focus("feeds", "add", "x")).stderr).toContain("X's feed is already blocked");
     expect((await focus("feeds", "list")).stdout).toBe(
@@ -1237,7 +1253,7 @@ describe("reddit", () => {
   });
 
   test("feeds list says when nothing is blocked", async () => {
-    expect((await focus("feeds", "list")).stdout).toBe("No feeds are blocked. Add one with `focus feeds add youtube x`.\n");
+    expect((await focus("feeds", "list")).stdout).toBe("No feeds are blocked. Add one with `focus feeds add youtube x instagram`.\n");
   });
 
   test.each([
@@ -1270,7 +1286,7 @@ describe("reddit", () => {
     const result = await focus("feeds", "add", "youtube");
     expect(result.stdout).toContain("The hosts file still blocks all of YouTube while focus is on, so this has no effect yet.\nTo stop that: focus remove youtube\n");
     expect((await focus("status")).stdout).toContain(
-      "Feeds:      YouTube (only the feed is blocked, in Chrome)\n            (no effect for YouTube: the hosts file blocks the whole site)\n",
+      "In Chrome:  YouTube feed only\n            (no effect for YouTube: the hosts file blocks the whole site)\n",
     );
   });
 
@@ -1281,7 +1297,7 @@ describe("reddit", () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("Press Enter to stop that (runs `focus remove x youtube`) (Esc skips) \n");
     expect(await read()).toBe(ORIGINAL);
-    expect((await focusWith({ chrome: fake.chrome }, "status")).stdout).toContain("Feeds:      YouTube, X (only the feed is blocked, in Chrome)\n");
+    expect((await focusWith({ chrome: fake.chrome }, "status")).stdout).toContain("In Chrome:  YouTube feed only, X feed only\n");
   });
 
   test("Esc keeps the preset", async () => {
@@ -1303,8 +1319,8 @@ describe("reddit", () => {
     const fake = fakeChrome();
     const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "chrome", "install");
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("focus feeds add youtube x     block just their feeds\n");
-    expect(result.stdout).toContain("focus reddit allow <name...>  limit Reddit to chosen subreddits\n");
+    expect(result.stdout).toContain("focus feeds add youtube x instagram  block just their feeds\n");
+    expect(result.stdout).toContain("focus reddit allow <name...>         limit Reddit to chosen subreddits\n");
   });
 
   test("chrome install points out presets that undo what Chrome is set to do", async () => {
@@ -1314,6 +1330,173 @@ describe("reddit", () => {
     const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "chrome", "install");
     expect(result.stdout).toContain("focus remove youtube  stop the hosts file from blocking all of YouTube\n");
     expect(result.stdout).not.toContain("focus reddit allow");
+  });
+
+  /** Installs the extension, then makes its folder look like an older version's. */
+  async function oldExtension(fake: ReturnType<typeof fakeChrome>, version = "0.1.3") {
+    await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "chrome", "install");
+    const manifest = join(fake.chrome.extensionDir, "manifest.json");
+    await Bun.write(manifest, JSON.stringify({ ...(await Bun.file(manifest).json()), version_name: version }));
+    await Bun.write(join(fake.chrome.extensionDir, "background.js"), "// old");
+  }
+
+  test("chrome update brings an older extension's files up to this version", async () => {
+    const fake = fakeChrome();
+    await oldExtension(fake);
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "chrome", "update");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toStartWith(`Updated the Chrome extension's files from 0.1.3 to ${VERSION}. Chrome reloads it`);
+    expect(await Bun.file(join(fake.chrome.extensionDir, "manifest.json")).json()).toMatchObject({ version_name: VERSION });
+    expect(await Bun.file(join(fake.chrome.extensionDir, "background.js")).text()).not.toBe("// old");
+    const again = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "chrome", "update");
+    expect(again.stdout).toBe(`The Chrome extension's files are up to date (${VERSION}).\n`);
+  });
+
+  test("chrome update says when there's nothing installed", async () => {
+    const result = await focusWith({ binaryPath: await binary(), chrome: fakeChrome().chrome }, "chrome", "update");
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("isn't set up; run `focus chrome install`");
+  });
+
+  test("feeds and reddit commands update an older extension's files first", async () => {
+    const fake = fakeChrome();
+    await oldExtension(fake);
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "feeds", "list");
+    expect(result.stdout).toStartWith(`Updated the Chrome extension's files from 0.1.3 to ${VERSION}.`);
+    expect((await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "reddit", "list")).stdout).not.toContain("Updated");
+  });
+
+  test("running from source never rewrites the extension's files", async () => {
+    const fake = fakeChrome();
+    await oldExtension(fake);
+    await focusWith({ binaryPath: null, chrome: fake.chrome }, "feeds", "list");
+    expect(await Bun.file(join(fake.chrome.extensionDir, "manifest.json")).json()).toMatchObject({ version_name: "0.1.3" });
+  });
+
+  test("status says when it can't see Chrome's profiles, instead of calling it not loaded", async () => {
+    const fake = fakeChrome();
+    await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "chrome", "install");
+    await mkdir(fake.chrome.profilesDir, { recursive: true });
+    await chmod(fake.chrome.profilesDir, 0o000);
+    try {
+      expect((await focusWith({ chrome: fake.chrome }, "status")).stdout).toContain(
+        "Extension:  set up; couldn't check whether Chrome has it loaded (no access to Chrome's profile files)\n",
+      );
+      await focus("add", "a.com");
+      expect((await focusWith({ chrome: fake.chrome }, "reddit", "allow", "rust")).stderr).not.toContain("hasn't loaded");
+    } finally {
+      await chmod(fake.chrome.profilesDir, 0o755);
+    }
+  });
+
+  /** A stand-in checklist: records what it was shown and answers with `pick` (given the initial values). */
+  function checklist(pick: (initial: string[]) => string[] | null) {
+    const seen: { message: string; groups: Record<string, { value: string; label: string }[]>; initial: string[] }[] = [];
+    return {
+      seen,
+      choose: async (message: string, groups: Record<string, { value: string; label: string }[]>, initial: string[]) => {
+        seen.push({ message, groups, initial });
+        return pick(initial);
+      },
+    };
+  }
+
+  test("config shows whole sites and the Chrome options, starting from what's set", async () => {
+    await focus("init", "youtube", "x");
+    await focus("feeds", "add", "instagram");
+    await focus("reddit", "allow", "rust");
+    const list = checklist(() => null);
+    await focusWith({ choose: list.choose }, "config");
+    const [{ groups, initial }] = list.seen as [(typeof list.seen)[number]];
+    expect(Object.keys(groups)).toEqual(["Block the whole site", "Or, in Chrome, just part of it"]);
+    expect(groups["Or, in Chrome, just part of it"]!.map((choice) => choice.label)).toEqual([
+      "YouTube: feed only",
+      "X: feed only",
+      "Instagram: messages only",
+      "Reddit: chosen subreddits only",
+    ]);
+    expect(initial).toEqual(["x", "youtube", "feed:instagram", "reddit:subreddits"]);
+  });
+
+  test("config switches YouTube from the whole site to feed only", async () => {
+    await focus("init", "youtube", "x");
+    const list = checklist(() => ["x", "feed:youtube"]);
+    const result = await focusWith({ choose: list.choose }, "config");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("✓ YouTube: feed only, in Chrome (videos still work)\n");
+    expect(await Bun.file(feedsFile()).json()).toEqual({ version: 1, feeds: ["youtube"] });
+    expect(await presetsLineOf()).toBe("Presets:    X / Twitter");
+    expect(result.stdout).toContain("Set it up with: focus chrome install");
+  });
+
+  test("config asks for subreddits when turning Reddit on, and keeps them when turning it off", async () => {
+    await focus("add", "a.com");
+    let asked = "";
+    const askText = async (message: string) => ((asked = message), "rust r/AskHistorians");
+    const on = await focusWith({ choose: checklist(() => ["reddit:subreddits"]).choose, askText }, "config");
+    expect(asked).toContain("Which subreddits");
+    expect(on.stdout).toContain("✓ Reddit: only r/rust, r/askhistorians, in Chrome\n");
+    expect(await Bun.file(allowlist()).json()).toEqual({ version: 1, allow: ["rust", "askhistorians"] });
+    const off = await focusWith({ choose: checklist(() => []).choose }, "config");
+    expect(off.stdout).toContain("✓ Reddit: no longer restricted in Chrome; your list is kept\n");
+    expect(await Bun.file(allowlist()).json()).toEqual({ version: 1, enabled: false, allow: ["rust", "askhistorians"] });
+    expect((await focus("status")).stdout).toContain("Subreddits: r/rust, r/askhistorians (off; turn it on with `focus config`)\n");
+    // Back on: the list is still there, so nothing to ask.
+    asked = "";
+    await focusWith({ choose: checklist(() => ["reddit:subreddits"]).choose, askText }, "config");
+    expect(asked).toBe("");
+    expect(await Bun.file(allowlist()).json()).toEqual({ version: 1, allow: ["rust", "askhistorians"] });
+  });
+
+  test("config says when a whole-site preset makes a Chrome option do nothing", async () => {
+    const result = await focusWith({ choose: checklist(() => ["youtube", "feed:youtube"]).choose }, "config");
+    expect(result.stdout).toContain("YouTube: the whole site is blocked, so the Chrome setting does nothing until you uncheck the whole site.");
+  });
+
+  test("config with nothing changed says so", async () => {
+    await focus("init", "x");
+    const result = await focusWith({ choose: checklist((initial) => initial).choose }, "config");
+    expect(result.stdout).toBe("No changes.\n");
+  });
+
+  test("config --dry-run shows the hosts diff and saves nothing", async () => {
+    const result = await focusWith({ choose: checklist(() => ["x", "feed:youtube"]).choose }, "config", "--dry-run");
+    expect(result.stdout).toContain("✓ YouTube: feed only, in Chrome (videos still work) (dry run: not saved)");
+    expect(result.stdout).toContain("+0.0.0.0 x.com");
+    expect(await Bun.file(feedsFile()).exists()).toBe(false);
+    expect(await read()).toBe(ORIGINAL);
+  });
+
+  test("config needs a terminal", async () => {
+    const result = await focus("config");
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("config needs an interactive terminal");
+  });
+
+  test("as root, config offers only whole sites", async () => {
+    const list = checklist(() => ["x"]);
+    await focusWith({ choose: list.choose, isRoot: true, systemHostsFile: hostsFile }, "config");
+    expect(Object.keys(list.seen[0]!.groups)).toEqual(["Block the whole site"]);
+    expect(await Bun.file(feedsFile()).exists()).toBe(false);
+  });
+
+  test("init welcomes you, starts from the recommended presets, and ends with what's next", async () => {
+    const list = checklist((initial) => initial);
+    const result = await focusWith({ choose: list.choose }, "init");
+    expect(result.stdout).toStartWith("focus blocks distracting sites while it's on.");
+    expect(list.seen[0]!.initial).toEqual(["x", "facebook", "youtube", "reddit"]);
+    expect(result.stdout).toContain("focus config      change what's blocked");
+  });
+
+  test("in a terminal, config offers to set up the extension the Chrome options need", async () => {
+    const fake = fakeChrome();
+    const result = await focusWith(
+      { choose: checklist(() => ["feed:x"]).choose, binaryPath: await binary(), chrome: fake.chrome, ...terminal(["enter", "skip"]) },
+      "config",
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("The Chrome options need the focus extension, which Chrome hasn't loaded yet.");
+    expect(result.stdout).toContain("✓ Registered focus with Chrome");
   });
 
   test("install refuses to run from source", async () => {

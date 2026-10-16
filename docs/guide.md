@@ -23,7 +23,7 @@ focus upgrade           # replace /usr/local/bin/focus with it, then sync preset
 
 `focus upgrade` downloads the latest release and checks its SHA-256 against `SHA256SUMS`. It then runs the new binary's `--version` and swaps it in atomically, keeping the file's mode and owner. If any step fails, the installed binary is left untouched.
 
-After swapping, the new binary runs `focus sync`, so your presets pick up any hostnames the new version added (see [Presets](#presets-focus-init)). Upgrades made with 0.1.0's `upgrade` command, or by re-running `install.sh`, skip this step. In that case `focus status` says a sync is needed; run `focus sync`.
+After swapping, the new binary runs `focus sync`, so your presets pick up any hostnames the new version added, and brings the Chrome extension's files up to date if you use it (see [Choosing what to block](#choosing-what-to-block-focus-init-and-focus-config)). Upgrades made with 0.1.0's `upgrade` command, or by re-running `install.sh`, skip this step. In that case `focus status` says a sync is needed; run `focus sync`.
 
 focus doesn't need a GitHub token to upgrade. If you have one, it's used to avoid API rate limits. focus looks in this order:
 
@@ -45,7 +45,8 @@ The build step re-signs the binary because macOS kills Bun's compiled output (ex
 ## Usage
 
 ```bash
-focus init                         # choose preset site groups from a checklist (see below)
+focus init                         # set up: choose what to block from a checklist (see below)
+focus config                       # change it later: the same checklist, starting from what's set
 focus add instagram                # turn one preset on…
 focus remove instagram             # …or off
 focus add example.com              # also blocks www.example.com
@@ -77,21 +78,33 @@ focus add -n twitter.com
 | `--hosts-file <path>` | Manage a different file. You can also set `FOCUS_HOSTS_FILE`. The default is `/etc/hosts`. |
 | `--flush` / `--no-flush` | Do (or don't) flush the DNS cache after writing. The default comes from the config file, or is `--flush`. |
 
-## Presets: `focus init`
+## Choosing what to block: `focus init` and `focus config`
 
-`focus init` opens a checklist of common distractions. Your current presets start checked; on a fresh install, the recommended ones are. The final selection replaces your presets, so unchecking one turns it off:
+`focus config` is one checklist of everything focus can block: whole sites (the presets), and the [Chrome options](#finer-blocking-in-chrome) that block only part of a site. What's set now starts checked, and the final selection replaces it, so unchecking something turns it off. `focus init` is the same checklist for your first run: it starts from the recommended presets, then tells you what's next.
 
 ```
-◆  Which sites should focus block?
-│  ◼ X / Twitter
-│  ◼ Facebook (doesn't include Messenger)
-│  ◼ YouTube
-│  ◼ Reddit (the whole site, every subreddit included)
-│  ◻ Instagram
-│  ...
-│  ◻ Messenger
+◆  What should focus block?
+│
+│   Block the whole site
+│    ◼ X / Twitter
+│    ◼ Facebook (doesn't include Messenger)
+│    ◻ YouTube (music.youtube.com stays reachable)
+│    ◼ Reddit (the whole site, every subreddit included)
+│    ◻ Instagram
+│    ...
+│
+│   Or, in Chrome, just part of it
+│    ◼ YouTube: feed only (videos still work)
+│    ◻ X: feed only
+│    ◻ Instagram: messages only
+│    ◻ Reddit: chosen subreddits only
 │  ↑/↓ to navigate • Space: select • Enter: confirm
 ```
+
+- **It runs as you.** The checklist and the Chrome options (which are your files) need no password; focus asks sudo only to change the hosts file, after you've chosen.
+- **Chrome options:** turning one on for the first time offers to set up the extension (`focus chrome install`). Turning on "Reddit: chosen subreddits only" asks which subreddits, unless you already have a list; turning it off keeps the list for next time.
+- **Both for one site:** if a site is checked both whole and in Chrome, the whole site is blocked and the Chrome option waits; `config` says so.
+- **`--dry-run`** shows the hosts file diff and what would change in Chrome, and saves nothing.
 
 | Preset | Recommended | Hostnames |
 | --- | --- | --- |
@@ -110,7 +123,7 @@ focus add -n twitter.com
 - **Presets follow new versions.** focus records which presets you chose (`# preset: <name>` in the hosts file) rather than just copying their hostnames. Whenever it writes the file, it rebuilds each preset from the running version's list. So when a preset gains a hostname, as X did with `api.x.com`, you get it after `focus upgrade` or any other change. Hostnames a preset drops are removed the same way. Sites you added yourself are never touched.
 - **One preset at a time:** `focus add instagram` and `focus remove instagram` turn a single preset on or off, and can be mixed with hostnames (`focus add tiktok example.com`). Hostnames always contain a dot, so a single word is always read as a preset. A word that isn't one is an error, with a suggestion when it looks like a typo or another name for one (`youtub` → `youtube`, `twitter` → `x`); nothing is changed.
 - **One preset is all or nothing.** `focus remove api.x.com` refuses and points you to `focus remove x`. Adding a hostname that a preset already covers is a no-op.
-- **Without a prompt:** `focus init x youtube` sets your presets to exactly the named ones, and `focus init --yes` keeps the current ones (or picks the recommended ones on a fresh install). Use one of these in scripts; `init` with neither stops with an error when there's no terminal.
+- **Without a prompt:** `focus init x youtube` sets your presets to exactly the named ones, and `focus init --yes` keeps the current ones (or picks the recommended ones on a fresh install). Use one of these in scripts; `init` with neither, and `config`, stop with an error when there's no terminal.
 - **Upgrading from 0.1.0:** 0.1.0 didn't record presets. The first time a newer version writes the file, any preset whose 0.1.0 hostnames are all present is recorded as that preset; everything else is kept as your own sites.
 
 ## Running without a password
@@ -206,6 +219,7 @@ Presets come first, each under its own `# preset:` header and in catalog order. 
 Presets block a whole site. For some sites, the problem is just the feed: you want a video someone sent you, or a post, but not the endless stream around it. The hosts file can't tell those apart, because they share hostnames and `/etc/hosts` only sees hostnames. So focus comes with a Chrome extension that can, while focus is on:
 
 - **Feeds only,** for YouTube and X: the feeds are blocked and direct links still work.
+- **Messages only,** for Instagram: every other page goes to your inbox.
 - **Chosen subreddits,** for Reddit: only the subreddits you allow load.
 
 While focus is off, these sites are unrestricted, as with everything else. `focus on`, `focus off` and `focus` (toggle) control the extension too; there's nothing else to switch.
@@ -226,15 +240,18 @@ After each step, `install` waits until Chrome has saved it, which takes up to ab
 ### Blocking only feeds
 
 ```bash
-focus feeds add youtube x
+focus feeds add youtube x instagram
 focus feeds remove x                # stop blocking X's feed
 focus feeds list
 ```
+
+`focus config` has the same options as checkboxes.
 
 | Site | Blocked | Still works |
 | --- | --- | --- |
 | `youtube` | The home page, Shorts, Explore and Trending. On video pages, the recommended videos beside and after the video are hidden, and autoplay doesn't move on to one (it still plays the next video of a playlist). | Videos, `youtu.be` links, search, channels, playlists, your subscriptions and YouTube Music |
 | `x` | The Home timeline, Explore and trends, search (including hashtags) and notifications | Posts and their replies, profiles, signing in |
+| `instagram` | Every page but your messages: Instagram sends you to your inbox instead of showing a blocked page | Your inbox and conversations, signing in |
 
 The `youtube` and `x` presets block these sites whole, before Chrome sees them, so feeds-only mode does nothing while they're on. `focus feeds add` offers to turn them off: press Enter and it runs `focus remove youtube` for you. `focus add youtube` blocks all of YouTube again whenever you want.
 
@@ -278,8 +295,8 @@ Reddit is only restricted once `~/.config/focus/subreddits.json` exists, so inst
 - **Chrome only.** With a site's preset off, it's open in Safari, its apps, other Chrome profiles, and Incognito unless you allowed the extension there.
 - **Removing your last blocked site** deletes the hosts section, so `focus on` has nothing to turn on, and the extension stops restricting anything. `focus feeds add` and `focus reddit allow` warn about this.
 - **Sites change.** YouTube and X rename their pages and page elements from time to time. When they do, a feed or a recommendation can slip through until focus is updated.
-- **Developer mode:** Chrome may remind you that a developer-mode extension is installed.
-- **After `focus upgrade`:** the extension updates itself the next time it talks to focus.
+- **Keep Developer mode on.** Chrome disables an extension loaded from a folder when it reloads, such as after an update, if Developer mode is off. Chrome may also remind you that a developer-mode extension is installed.
+- **After `focus upgrade`:** focus updates the extension's files, and the extension reloads itself the next time it talks to focus, when you next open one of these sites. `focus chrome update` updates the files by hand; you never need to load the extension again.
 
 ### Removing it
 

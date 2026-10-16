@@ -97,7 +97,7 @@ describe("respond", () => {
     await Bun.write(hosts, section("off", "a.com"));
     await Bun.write(join(dir, "feeds.json"), "{ nope");
     const reply = await respond({ type: "status" }, deps());
-    expect(reply).toMatchObject({ state: "off", feeds: ["youtube", "x"], feedsError: expect.stringMatching(/invalid JSON/) });
+    expect(reply).toMatchObject({ state: "off", feeds: ["youtube", "x", "instagram"], feedsError: expect.stringMatching(/invalid JSON/) });
     expect(reply).not.toHaveProperty("error");
   });
 

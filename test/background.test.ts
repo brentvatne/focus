@@ -172,7 +172,7 @@ describe("startup", () => {
       throw new Error("Specified native messaging host not found.");
     };
     await startWorker("onInstalled");
-    expect(fake.state.rules).toEqual(buildRules({ state: "on", reddit: true, allow: [], feeds: ["youtube", "x"] }));
+    expect(fake.state.rules).toEqual(buildRules({ state: "on", reddit: true, allow: [], feeds: ["youtube", "x", "instagram"] }));
     expect(fake.state.storage.hostError).toContain("Chrome couldn't run focus");
   });
 });
@@ -276,6 +276,24 @@ describe("feeds", () => {
     };
     await startWorker();
     expect(fake.state.rules).toEqual(buildRules({ state: "on", reddit: true, allow: ["rust"], feeds: [] }));
+  });
+});
+
+describe("Instagram", () => {
+  test("a client-side route away from messages goes straight to the inbox, in any window", async () => {
+    fake.state.reply = () => status("on", [], { reddit: false, feeds: ["instagram"] });
+    await startWorker();
+    openTab(1, "https://www.instagram.com/direct/inbox/");
+    openTab(2, "https://www.instagram.com/direct/inbox/", true);
+    await route(1, "https://www.instagram.com/");
+    await route(2, "https://www.instagram.com/explore/");
+    await route(1, "https://www.instagram.com/direct/inbox/");
+    await route(1, "https://www.instagram.com/direct/t/123/");
+    await settle();
+    expect(fake.state.navigations).toEqual([
+      { tabId: 1, url: "https://www.instagram.com/direct/inbox/" },
+      { tabId: 2, url: "https://www.instagram.com/direct/inbox/" },
+    ]);
   });
 });
 

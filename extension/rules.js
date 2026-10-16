@@ -8,15 +8,15 @@ export const PROTOCOL = 1;
 
 /**
  * @typedef {"on" | "off" | "none"} State
- * @typedef {"reddit" | "youtube" | "x"} Site
+ * @typedef {"reddit" | "youtube" | "x" | "instagram"} Site
  * @typedef {{ state: State, reddit: boolean, allow: string[], feeds: string[] }} Policy
  *   reddit: whether Reddit is limited to `allow` (once you've run `focus reddit allow`);
- *   feeds: the sites whose feeds are blocked ("youtube", "x").
+ *   feeds: the sites whose feeds are blocked ("youtube", "x"), or that are limited to messages ("instagram").
  * @typedef {"main_frame" | "sub_frame"} FrameType
  * @typedef {{
  *   id: number,
  *   priority: number,
- *   action: { type: "allow" | "block" },
+ *   action: { type: "allow" | "block" } | { type: "redirect", redirect: { url: string } },
  *   condition: { regexFilter?: string, requestDomains?: string[], resourceTypes: FrameType[] },
  * }} Rule
  */
@@ -25,6 +25,10 @@ const FRAMES = /** @type {FrameType[]} */ (["main_frame", "sub_frame"]);
 const REDDIT = String.raw`^https?://([a-z0-9-]+\.)*reddit\.com`;
 const YOUTUBE = String.raw`^https?://((www|m)\.)?youtube\.com`;
 const X = String.raw`^https?://((www|mobile)\.)?(x|twitter)\.com`;
+const INSTAGRAM = String.raw`^https?://(www\.)?instagram\.com`;
+
+/** Where Instagram pages go while it's limited to messages. */
+export const INSTAGRAM_INBOX = "https://www.instagram.com/direct/inbox/";
 const END = String.raw`([/?#]|$)`;
 
 /** The hostnames each site uses, for matching tabs and navigation events. */
@@ -32,6 +36,7 @@ export const SITE_HOSTS = /** @type {const} */ ({
   reddit: ["reddit.com"],
   youtube: ["youtube.com", "youtu.be"],
   x: ["x.com", "twitter.com"],
+  instagram: ["instagram.com"],
 });
 
 /** A page of each site that its rules block, for Incognito tabs, which can't show focus's own page. */
@@ -39,10 +44,11 @@ export const BLOCKED_PAGES = /** @type {const} */ ({
   reddit: "https://www.reddit.com/",
   youtube: "https://www.youtube.com/",
   x: "https://x.com/home",
+  instagram: INSTAGRAM_INBOX,
 });
 
 /** Used when nothing has been heard from `focus` yet: everything restricted, as strictly as it gets. */
-export const UNKNOWN_POLICY = /** @type {Policy} */ ({ state: "on", reddit: true, allow: [], feeds: ["youtube", "x"] });
+export const UNKNOWN_POLICY = /** @type {Policy} */ ({ state: "on", reddit: true, allow: [], feeds: ["youtube", "x", "instagram"] });
 
 /**
  * @param {Policy} policy
@@ -54,6 +60,7 @@ export function buildRules(policy) {
     ...(policy.reddit ? redditRules(policy.allow) : []),
     ...(policy.feeds.includes("youtube") ? youtubeRules() : []),
     ...(policy.feeds.includes("x") ? xRules() : []),
+    ...(policy.feeds.includes("instagram") ? instagramRules() : []),
   ];
 }
 
@@ -112,6 +119,23 @@ function xRules() {
 }
 
 /**
+ * Instagram, limited to messages: every page goes to the inbox except messages themselves and
+ * signing in (and the security checks that can come with it). Ids 40-49.
+ * @returns {Rule[]}
+ */
+function instagramRules() {
+  return [
+    {
+      id: 40,
+      priority: 1,
+      action: { type: "redirect", redirect: { url: INSTAGRAM_INBOX } },
+      condition: { regexFilter: `${INSTAGRAM}/`, resourceTypes: ["main_frame"] },
+    },
+    rule(41, 2, "allow", { regexFilter: `${INSTAGRAM}/(direct|accounts|challenge|two_factor)${END}` }, ["main_frame"]),
+  ];
+}
+
+/**
  * The site a URL belongs to, or null.
  * @param {string} url
  * @returns {Site | null}
@@ -142,19 +166,20 @@ function rule(id, priority, type, match, resourceTypes = FRAMES) {
 }
 
 /**
- * What Chrome would do with a request: the highest-priority matching rule wins,
- * and at equal priority allow beats block. Returns null when no rule matches.
+ * What Chrome would do with a request: the highest-priority matching rule wins, and at
+ * equal priority allow beats block, which beats redirect. Returns null when no rule matches.
  * Regexes are case-insensitive, like DNR's default.
  *
  * @param {Rule[]} rules
  * @param {string} url
  * @param {FrameType} resourceType
- * @returns {"allow" | "block" | null}
+ * @returns {"allow" | "block" | "redirect" | null}
  */
 export function evaluate(rules, url, resourceType = "main_frame") {
   let host;
   try {
-    host = new URL(url).hostname;
+    // Chrome matches the normalized URL: "https://instagram.com" arrives as "https://instagram.com/".
+    ({ hostname: host, href: url } = new URL(url));
   } catch {
     return null;
   }
@@ -170,7 +195,7 @@ export function evaluate(rules, url, resourceType = "main_frame") {
     if (
       !winner ||
       candidate.priority > winner.priority ||
-      (candidate.priority === winner.priority && candidate.action.type === "allow")
+      (candidate.priority === winner.priority && RANK[candidate.action.type] > RANK[winner.action.type])
     ) {
       winner = candidate;
     }
@@ -183,8 +208,12 @@ export function evaluate(rules, url, resourceType = "main_frame") {
  * @param {string} url
  */
 export function isAllowed(policy, url) {
-  return evaluate(buildRules(policy), url) !== "block";
+  const action = evaluate(buildRules(policy), url);
+  return action === null || action === "allow";
 }
+
+/** Chrome's order among actions at the same priority. */
+const RANK = { allow: 3, block: 2, redirect: 1 };
 
 /**
  * Whether a page may stay open. A post page reports the subreddit its canonical link

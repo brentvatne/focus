@@ -7,6 +7,7 @@ const REASONS = {
   reddit: "Only the subreddits you've allowed load while focus is on.",
   youtube: "focus blocks YouTube's home page, Shorts and Explore while it's on. Links to videos, search, channels and your subscriptions still work.",
   x: "focus blocks X's timeline, Explore, search and notifications while it's on. Links to posts and profiles still work.",
+  instagram: "Only your messages load on Instagram while focus is on.",
 };
 
 const url = decodeURIComponent(location.hash.slice(1));
@@ -39,7 +40,7 @@ setWithCode(
   element("howto"),
   site === "reddit" && subreddit
     ? `To allow it, run \`focus reddit allow ${subreddit}\`. To take a break, run \`focus off\`.`
-    : site === "youtube" || site === "x"
+    : site === "youtube" || site === "x" || site === "instagram"
       ? `To take a break, run \`focus off\`. To stop blocking the feed, run \`focus feeds remove ${site}\`.`
       : "To take a break, run `focus off`.",
 );

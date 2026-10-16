@@ -1,4 +1,4 @@
-import { mkdir, readdir, realpath, rename, rm, stat } from "node:fs/promises";
+import { mkdir, open, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { writeAtomically } from "./hostsfile.ts";
@@ -61,20 +61,35 @@ export interface LoadedExtension {
 /**
  * The Chrome profiles that have the extension in `extensionDir` loaded (with Load unpacked),
  * from each profile's Secure Preferences. Chrome saves these about 10 seconds after a change.
- * Read only; an unreadable or unfamiliar profile counts as not having it.
+ * Read only. Null when focus isn't allowed to read them (a sandbox, or macOS privacy settings),
+ * so "can't tell" never looks like "not loaded".
  */
-export async function findLoadedExtension(profilesDir: string, id: string, extensionDir: string): Promise<LoadedExtension[]> {
+export async function findLoadedExtension(
+  profilesDir: string,
+  id: string,
+  extensionDir: string,
+): Promise<LoadedExtension[] | null> {
   const target = await realpath(extensionDir).catch(() => extensionDir);
-  const localState = await Bun.file(join(profilesDir, "Local State"))
-    .json()
-    .catch(() => null);
+  const denied = (error: unknown) => ["EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "");
+  let folders: string[];
+  try {
+    folders = await readdir(profilesDir);
+  } catch (error) {
+    if (denied(error)) return null;
+    return []; // No Chrome profiles at all.
+  }
+  const localState = await readJson(join(profilesDir, "Local State")).catch(() => null);
   const names: Record<string, { name?: unknown }> = localState?.profile?.info_cache ?? {};
-  const folders = await readdir(profilesDir).catch(() => [] as string[]);
   const found: LoadedExtension[] = [];
+  let unreadable = false;
   for (const folder of folders.filter((name) => name === "Default" || /^Profile \d+$/.test(name)).sort()) {
-    const prefs = await Bun.file(join(profilesDir, folder, "Secure Preferences"))
-      .json()
-      .catch(() => null);
+    let prefs;
+    try {
+      prefs = await readJson(join(profilesDir, folder, "Secure Preferences"));
+    } catch (error) {
+      if (denied(error)) unreadable = true;
+      continue; // Missing, or caught mid-write: Chrome will have saved it by the next look.
+    }
     const entry = prefs?.extensions?.settings?.[id];
     if (typeof entry?.path !== "string") continue;
     const path = await realpath(entry.path).catch(() => entry.path);
@@ -82,7 +97,23 @@ export async function findLoadedExtension(profilesDir: string, id: string, exten
     const name = names[folder]?.name;
     found.push({ profile: typeof name === "string" ? name : folder, incognito: entry.incognito === true });
   }
-  return found;
+  return found.length === 0 && unreadable ? null : found;
+}
+
+// Bun.file().json() hides the error code that tells "not allowed" from "not there".
+async function readJson(path: string): Promise<any> {
+  const handle = await open(path, "r");
+  try {
+    return JSON.parse(await handle.readFile("utf8"));
+  } finally {
+    await handle.close();
+  }
+}
+
+/** The focus version whose extension files are in `extensionDir`, or null if there are none. */
+export async function installedExtensionVersion(extensionDir: string): Promise<string | null> {
+  const manifest = await readJson(join(extensionDir, "manifest.json")).catch(() => null);
+  return typeof manifest?.version_name === "string" ? manifest.version_name : null;
 }
 
 /** Chrome's extension id for a manifest `key`: the first 128 bits of its SHA-256, as letters a-p. */
