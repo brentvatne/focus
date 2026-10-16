@@ -16,7 +16,16 @@ export interface UpgradeDeps {
   arch: string;
   /** Runs `<path> --version` and returns its output; throws if it can't run. */
   runVersion(path: string): Promise<string>;
+  /** Told what's happening, for a progress display. */
+  progress?(event: UpgradeProgress): void;
 }
+
+export type UpgradeProgress =
+  | { step: "checking" }
+  /** `total` is null when GitHub doesn't say how big the download is. */
+  | { step: "downloading"; version: string; received: number; total: number | null }
+  | { step: "verifying"; version: string }
+  | { step: "installing"; version: string; path: string };
 
 export type UpgradeResult =
   | { status: "up-to-date"; current: string }
@@ -31,6 +40,8 @@ interface Release {
 /** Replaces the running binary with the latest GitHub release, or only checks when dryRun is set. */
 export async function upgrade(current: string, dryRun: boolean, deps: UpgradeDeps): Promise<UpgradeResult> {
   if (deps.arch !== "arm64") throw new UpgradeError(`releases are only built for Apple silicon (arm64), not ${deps.arch}`);
+  const progress = deps.progress ?? (() => {});
+  progress({ step: "checking" });
 
   const token = await deps.token();
   const headers = (accept: string): Record<string, string> => ({
@@ -60,7 +71,7 @@ export async function upgrade(current: string, dryRun: boolean, deps: UpgradeDep
     throw new UpgradeError("focus is running from source; upgrade only replaces an installed release binary");
   }
 
-  const download = async (name: string): Promise<Uint8Array> => {
+  const download = async (name: string, onChunk?: (received: number, total: number | null) => void): Promise<Uint8Array> => {
     const asset = release.assets.find((candidate) => candidate.name === name);
     if (!asset) throw new UpgradeError(`release ${release.tag_name} has no ${name} asset`);
     // Asset URLs redirect to signed storage URLs that reject a second Authorization header.
@@ -68,10 +79,25 @@ export async function upgrade(current: string, dryRun: boolean, deps: UpgradeDep
     const location = res.headers.get("location");
     if (res.status >= 300 && res.status < 400 && location) res = await deps.fetch(location);
     if (!res.ok) throw new UpgradeError(`downloading ${name} failed with HTTP ${res.status}`);
-    return new Uint8Array(await res.arrayBuffer());
+    if (!onChunk || !res.body) return new Uint8Array(await res.arrayBuffer());
+    const length = Number(res.headers.get("content-length"));
+    const total = Number.isFinite(length) && length > 0 ? length : null;
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    onChunk(0, total);
+    for await (const chunk of res.body) {
+      chunks.push(chunk);
+      received += chunk.length;
+      onChunk(received, total);
+    }
+    return Buffer.concat(chunks);
   };
 
-  const [binary, sums] = await Promise.all([download(ASSET), download(CHECKSUMS)]);
+  const [binary, sums] = await Promise.all([
+    download(ASSET, (received, total) => progress({ step: "downloading", version: latest, received, total })),
+    download(CHECKSUMS),
+  ]);
+  progress({ step: "verifying", version: latest });
   const expected = new TextDecoder()
     .decode(sums)
     .split("\n")
@@ -83,6 +109,7 @@ export async function upgrade(current: string, dryRun: boolean, deps: UpgradeDep
 
   const path = await realpath(deps.binaryPath);
   const info = await stat(path);
+  progress({ step: "installing", version: latest, path });
   try {
     await writeAtomically(path, binary, { mode: info.mode & 0o7777, uid: info.uid, gid: info.gid }, async (temp) => {
       const output = await deps.runVersion(temp).catch((error) => {

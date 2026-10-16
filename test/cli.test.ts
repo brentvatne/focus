@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Io, run } from "../src/cli.ts";
 import { encodeMessage, readMessage } from "../src/nativehost.ts";
-import { UpgradeError } from "../src/upgrade.ts";
+import { UpgradeError, type UpgradeProgress } from "../src/upgrade.ts";
 import { VERSION } from "../src/version.ts";
 
 const ORIGINAL = `##
@@ -45,6 +45,7 @@ async function focusWith(overrides: Partial<Io>, ...argv: string[]) {
     // Always point at temp files so tests can never fall through to /etc/hosts or the real user config.
     env: { FOCUS_HOSTS_FILE: hostsFile, FOCUS_CONFIG: configFile },
     color: false,
+    stderrIsTerminal: false,
     flushDns: async () => void flushes++,
     upgrade: async () => {
       throw new Error("tests must stub upgrade; it would reach GitHub");
@@ -615,6 +616,51 @@ describe("version and upgrade", () => {
     const upgrade = async () => ({ status: "up-to-date" as const, current: "0.1.0" });
     const result = await focusWith({ upgrade }, "--hosts-file", join(dir, "missing"), "upgrade");
     expect(result.code).toBe(0);
+  });
+
+  const reportingUpgrade = async (_: boolean, progress: (event: UpgradeProgress) => void) => {
+    progress({ step: "checking" });
+    for (const received of [0, 30_000_000, 60_000_000]) {
+      progress({ step: "downloading", version: "0.2.0", received, total: 60_000_000 });
+    }
+    progress({ step: "verifying", version: "0.2.0" });
+    progress({ step: "installing", version: "0.2.0", path: "/usr/local/bin/focus" });
+    return upgraded();
+  };
+
+  test("shows one line per step on stderr when it isn't a terminal", async () => {
+    const result = await focusWith({ upgrade: reportingUpgrade, runBinary: async () => 0 }, "upgrade");
+    expect(result.stderr).toBe(
+      "Checking for a new version…\n" +
+        "Downloading focus 0.2.0… 0% of 60.0 MB\n" +
+        "Verifying focus 0.2.0…\n" +
+        "Installing focus 0.2.0 at /usr/local/bin/focus…\n",
+    );
+    expect(result.stdout).toBe("Upgraded focus 0.1.0 -> 0.2.0 (/usr/local/bin/focus).\n");
+  });
+
+  test("redraws a single status line in a terminal and erases it before the result", async () => {
+    const result = await focusWith({ upgrade: reportingUpgrade, runBinary: async () => 0, stderrIsTerminal: true }, "upgrade");
+    const redraw = "\r\x1b[K";
+    expect(result.stderr).toBe(
+      `${redraw}Checking for a new version…` +
+        `${redraw}Downloading focus 0.2.0… 0% of 60.0 MB` +
+        `${redraw}Downloading focus 0.2.0… 50% of 60.0 MB` +
+        `${redraw}Downloading focus 0.2.0… 100% of 60.0 MB` +
+        `${redraw}Verifying focus 0.2.0…` +
+        `${redraw}Installing focus 0.2.0 at /usr/local/bin/focus…` +
+        redraw,
+    );
+  });
+
+  test("erases the status line when the upgrade fails", async () => {
+    const upgrade = async (_: boolean, progress: (event: UpgradeProgress) => void) => {
+      progress({ step: "checking" });
+      throw new UpgradeError("GitHub API returned 500 for brentvatne/focus releases");
+    };
+    const result = await focusWith({ upgrade, stderrIsTerminal: true }, "upgrade");
+    expect(result.code).toBe(1);
+    expect(result.stderr).toBe("\r\x1b[KChecking for a new version…\r\x1b[Kfocus: GitHub API returned 500 for brentvatne/focus releases\n");
   });
 
   test("reports upgrade failures", async () => {

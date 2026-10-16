@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, readdir, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ASSET, CHECKSUMS, UpgradeError, type UpgradeDeps, compareVersions, upgrade } from "../src/upgrade.ts";
+import {
+  ASSET,
+  CHECKSUMS,
+  UpgradeError,
+  type UpgradeDeps,
+  type UpgradeProgress,
+  compareVersions,
+  upgrade,
+} from "../src/upgrade.ts";
 
 const NEW_BINARY = new TextEncoder().encode("new focus binary");
 const sha256 = (bytes: Uint8Array) => new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
@@ -28,6 +36,8 @@ interface FakeGitHub {
   assets?: string[];
   binary?: Uint8Array;
   sums?: string;
+  /** Leave out Content-Length, as a chunked response would. */
+  noLength?: boolean;
 }
 
 /** Fakes the GitHub releases API, including the redirect from asset URLs to signed storage URLs. */
@@ -52,7 +62,18 @@ function fakeGitHub(options: FakeGitHub = {}) {
     const asset = /\/assets\/(.+)$/.exec(url)?.[1];
     if (asset) return new Response(null, { status: 302, headers: { location: `https://storage.example/${asset}` } });
     const stored = /storage\.example\/(.+)$/.exec(url)?.[1];
-    if (stored && files[stored]) return new Response(files[stored]);
+    if (stored && files[stored]) {
+      const bytes = files[stored];
+      // In two chunks, like a real download.
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(bytes.slice(0, 4));
+          controller.enqueue(bytes.slice(4));
+          controller.close();
+        },
+      });
+      return new Response(body, { headers: options.noLength ? {} : { "content-length": String(bytes.length) } });
+    }
     return new Response("not found", { status: 404 });
   };
   return { fetch, calls };
@@ -85,6 +106,37 @@ describe("upgrade", () => {
     for (const call of github.calls) {
       expect(call.auth).toBe(call.url.startsWith("https://api.github.com/") ? "Bearer secret" : null);
     }
+  });
+
+  test("reports each step, and the download as it arrives", async () => {
+    const events: UpgradeProgress[] = [];
+    await upgrade("0.1.0", false, deps({ progress: (event) => events.push(event) }));
+    const total = NEW_BINARY.length;
+    expect(events).toEqual([
+      { step: "checking" },
+      { step: "downloading", version: "0.2.0", received: 0, total },
+      { step: "downloading", version: "0.2.0", received: 4, total },
+      { step: "downloading", version: "0.2.0", received: total, total },
+      { step: "verifying", version: "0.2.0" },
+      { step: "installing", version: "0.2.0", path: binary },
+    ]);
+  });
+
+  test("reports the download without a total when GitHub doesn't send one", async () => {
+    const events: UpgradeProgress[] = [];
+    await upgrade("0.1.0", false, deps({ fetch: fakeGitHub({ noLength: true }).fetch, progress: (event) => events.push(event) }));
+    expect(events.filter((event) => event.step === "downloading").map((event) => "total" in event && event.total)).toEqual([
+      null,
+      null,
+      null,
+    ]);
+    expect(await Bun.file(binary).bytes()).toEqual(NEW_BINARY);
+  });
+
+  test("a dry run only reports checking", async () => {
+    const events: UpgradeProgress[] = [];
+    await upgrade("0.1.0", true, deps({ progress: (event) => events.push(event) }));
+    expect(events).toEqual([{ step: "checking" }]);
   });
 
   test("runs the new binary before swapping it in", async () => {

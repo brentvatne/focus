@@ -49,7 +49,7 @@ import {
   readAllowlist,
   writeAllowlist,
 } from "./subreddits.ts";
-import { UpgradeError, type UpgradeResult, upgrade } from "./upgrade.ts";
+import { UpgradeError, type UpgradeProgress, type UpgradeResult, upgrade } from "./upgrade.ts";
 import { VERSION } from "./version.ts";
 
 const USAGE = `Usage: focus [command] [options]
@@ -99,11 +99,13 @@ export interface Io {
   stderr(text: string): void;
   env: Record<string, string | undefined>;
   color: boolean;
+  /** stderr is a terminal, so progress can redraw a single line instead of printing one per step. */
+  stderrIsTerminal: boolean;
   /** Called after /etc/hosts itself (never any other file) has been rewritten. */
   flushDns(): Promise<void>;
   /** Asks which presets to block; resolves to their ids, or null if cancelled. Absent without a terminal. */
   selectPresets?(presets: Preset[], initial: string[]): Promise<string[] | null>;
-  upgrade(dryRun: boolean): Promise<UpgradeResult>;
+  upgrade(dryRun: boolean, progress: (event: UpgradeProgress) => void): Promise<UpgradeResult>;
   /** Runs a binary with the given arguments and this process's stdio; resolves to its exit code. */
   runBinary(path: string, args: string[]): Promise<number>;
   isRoot: boolean;
@@ -177,14 +179,18 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
     if (args.length > 0) throw new UsageError(`${command} takes no arguments`);
     if (!values["dry-run"] && !io.isRoot && io.binaryPath && !(await isWritable(dirname(await realpath(io.binaryPath))))) {
       // Only ask for root once there's actually something to install.
-      const check = await io.upgrade(true);
+      const status = statusLine(io);
+      const check = await io.upgrade(true, (event) => status.show(describeProgress(event))).finally(status.clear);
       if (check.status !== "available") {
         io.stdout(formatUpgrade(check));
         return 0;
       }
       return elevate(argv, io);
     }
-    const result = await io.upgrade(values["dry-run"] ?? false);
+    const status = statusLine(io);
+    const result = await io
+      .upgrade(values["dry-run"] ?? false, (event) => status.show(describeProgress(event)))
+      .finally(status.clear);
     io.stdout(formatUpgrade(result));
     if (result.status !== "upgraded") return 0;
 
@@ -677,6 +683,51 @@ function formatStatus(path: string, section: FocusSection | null): string {
   return lines.join("\n") + "\n";
 }
 
+/**
+ * A one-line status on stderr. In a terminal it redraws in place and is erased when done;
+ * otherwise each new step gets its own line, and updates within a step (the download's
+ * percentage) are left out so logs stay short.
+ */
+function statusLine(io: Io): { show(progress: { step: string; text: string }): void; clear(): void } {
+  let shown: string | null = null;
+  return {
+    show({ step, text }) {
+      if (io.stderrIsTerminal) {
+        if (text !== shown) io.stderr(`\r\x1b[K${text}`);
+        shown = text;
+      } else if (step !== shown) {
+        io.stderr(`${text}\n`);
+        shown = step;
+      }
+    },
+    clear() {
+      if (io.stderrIsTerminal && shown !== null) io.stderr("\r\x1b[K");
+      shown = null;
+    },
+  };
+}
+
+function describeProgress(event: UpgradeProgress): { step: string; text: string } {
+  switch (event.step) {
+    case "checking":
+      return { step: event.step, text: "Checking for a new version…" };
+    case "downloading": {
+      const text = `Downloading focus ${event.version}…`;
+      if (event.total === null) return { step: event.step, text: `${text} ${megabytes(event.received)}` };
+      const percent = Math.floor((event.received / event.total) * 100);
+      return { step: event.step, text: `${text} ${percent}% of ${megabytes(event.total)}` };
+    }
+    case "verifying":
+      return { step: event.step, text: `Verifying focus ${event.version}…` };
+    case "installing":
+      return { step: event.step, text: `Installing focus ${event.version} at ${event.path}…` };
+  }
+}
+
+function megabytes(bytes: number): string {
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+}
+
 function formatUpgrade(result: UpgradeResult): string {
   switch (result.status) {
     case "up-to-date":
@@ -778,10 +829,12 @@ if (import.meta.main) {
     stderr: (text) => process.stderr.write(text),
     env: process.env,
     color: process.stdout.isTTY === true && !process.env.NO_COLOR,
+    stderrIsTerminal: process.stderr.isTTY === true,
     flushDns: flushMacDnsCache,
     selectPresets: process.stdin.isTTY && process.stdout.isTTY ? promptForPresets : undefined,
-    upgrade: (dryRun) =>
+    upgrade: (dryRun, progress) =>
       upgrade(VERSION, dryRun, {
+        progress,
         fetch,
         token: () => githubToken(process.env),
         // Compiled executables run from Bun's embedded filesystem.
