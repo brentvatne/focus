@@ -1,6 +1,7 @@
 // @ts-check
-// Runs on bare /comments/<id> pages, which is where redd.it shortlinks land. The URL doesn't
-// say which subreddit the post is in, so report the one its canonical link names.
+// Runs on post pages. A bare /comments/<id> or /gallery/<id> URL (where redd.it shortlinks
+// land) doesn't say which subreddit the post is in, and /r/<name>/comments/<id> may name the
+// wrong one, so report the subreddit the page's canonical link names.
 (() => {
   const canonical = document.querySelector('link[rel="canonical"]');
   let subreddit = null;

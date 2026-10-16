@@ -67,7 +67,10 @@ export interface StatusReply {
   redditBlockedByHosts: boolean;
   /** focus rewrote the extension's folder for this version; the extension should reload. */
   reload: boolean;
+  /** The hosts file couldn't be read; the extension keeps its last rules. */
   error?: string;
+  /** The allowlist couldn't be read, so `allow` is empty: nothing is allowed while on, and off still means off. */
+  allowlistError?: string;
 }
 
 export async function respond(request: unknown, deps: NativeHostDeps): Promise<StatusReply | { error: string }> {
@@ -87,15 +90,18 @@ export async function respond(request: unknown, deps: NativeHostDeps): Promise<S
     const section = readSection((await readHostsFile(deps.systemHostsFile)).content);
     reply.state = section && !isEmpty(section) ? section.state : "none";
     reply.redditBlockedByHosts = section !== null && blocksReddit(section);
-    reply.allow = (await readAllowlist(deps.allowlistPath)).allow;
   } catch (error) {
     reply.state = "error";
     reply.error =
       error instanceof HostsFormatError
         ? `the focus section of the hosts file is malformed (${error.message})`
-        : error instanceof Error
-          ? error.message
-          : String(error);
+        : messageOf(error);
+  }
+  // Separate from the state, so a bad allowlist can't stop `focus off` from turning the extension off.
+  try {
+    reply.allow = (await readAllowlist(deps.allowlistPath)).allow;
+  } catch (error) {
+    reply.allowlistError = messageOf(error);
   }
 
   // Only a folder focus wrote reports a version_name, so a development copy is never rewritten.
@@ -109,6 +115,10 @@ export async function respond(request: unknown, deps: NativeHostDeps): Promise<S
     }
   }
   return reply;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** Whether the hosts section lists Reddit, so DNS blocks every subreddit while focus is on. */

@@ -38,10 +38,14 @@ export function buildRules(policy) {
     // Signing in, and Reddit's redirector for links to other sites.
     rule(2, 2, "allow", { regexFilter: `${REDDIT}/(login|register|logout)${END}` }),
     rule(3, 2, "allow", { regexFilter: String.raw`^https?://out\.reddit\.com/` }),
-    // redd.it/<id> redirects here; comments.js checks which subreddit the post is in.
-    rule(4, 2, "allow", { regexFilter: `${REDDIT}/comments/[a-z0-9]+${END}` }, ["main_frame"]),
-    // A subreddit's search can search all of Reddit (restrict_sr=off), so it stays blocked.
-    rule(5, 3, "block", { regexFilter: `${REDDIT}/r/[^/?#]+/search${END}` }),
+    // Posts without a subreddit in the URL (redd.it/<id> lands on /comments/<id>); comments.js
+    // checks which subreddit the post is in.
+    rule(4, 2, "allow", { regexFilter: `${REDDIT}/(comments|gallery)/[a-z0-9]+${END}` }, ["main_frame"]),
+    // Within a subreddit, pages that show the rest of Reddit stay blocked: search (restrict_sr=off
+    // searches everything), duplicates (other subreddits' posts) and the API, including .json and .rss.
+    rule(5, 3, "block", { regexFilter: String.raw`${REDDIT}/r/[^/?#]+/(search|duplicates|api)([./?#]|$)` }),
+    // An image opened in a tab: i.redd.it sends browsers to this viewer, which shows only that image.
+    rule(6, 2, "allow", { regexFilter: `${REDDIT}/media${END}` }, ["main_frame"]),
   ];
   policy.allow.forEach((name, index) => {
     rules.push(rule(100 + index, 2, "allow", { regexFilter: `${REDDIT}/r/${name}${END}` }));
@@ -107,26 +111,39 @@ export function isAllowed(policy, url) {
 }
 
 /**
- * Whether a page may stay open. A bare /comments/<id> URL doesn't say which subreddit
- * the post is in, so for those the page's own report (from comments.js) decides.
+ * Whether a page may stay open. A post page reports the subreddit its canonical link
+ * names (comments.js), and that must be allowed too: a bare /comments/<id> URL doesn't
+ * say, and /r/<allowed>/comments/<id> could be a post from anywhere.
  *
  * @param {Policy} policy
  * @param {string} url
- * @param {string | null} subreddit the subreddit a bare comments page reported, if any
+ * @param {string | null} subreddit the subreddit the page reported, if any
  */
 export function mayStay(policy, url, subreddit = null) {
   if (!isAllowed(policy, url)) return false;
-  if (policy.state !== "on" || !isBareComments(url)) return true;
-  return subreddit !== null && policy.allow.includes(subreddit.toLowerCase());
+  if (policy.state !== "on") return true;
+  if (subreddit !== null) return policy.allow.includes(subreddit.toLowerCase());
+  return !isBarePost(url);
 }
 
-/** @param {string} url */
-export function isBareComments(url) {
+/**
+ * A post's id, for /comments/<id>, /gallery/<id> and /r/<name>/comments/<id>, or null.
+ * @param {string} url
+ */
+export function postIdOf(url) {
   try {
-    return /^\/comments\/[a-z0-9]+([/?#]|$)/i.test(new URL(url).pathname);
+    return /^(?:\/r\/[^/]+)?\/(?:comments|gallery)\/([a-z0-9]+)(?:[/?#]|$)/i.exec(new URL(url).pathname)?.[1]?.toLowerCase() ?? null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/**
+ * A post page whose URL doesn't name its subreddit: /comments/<id> or /gallery/<id>.
+ * @param {string} url
+ */
+export function isBarePost(url) {
+  return postIdOf(url) !== null && subredditOf(url) === null;
 }
 
 /**

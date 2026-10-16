@@ -10,6 +10,10 @@
   "permissions": ["alarms", "declarativeNetRequest", "nativeMessaging", "storage", "tabs", "webNavigation"],
   "host_permissions": ["*://*.reddit.com/*"],
   "content_scripts": [
-    { "matches": ["*://*.reddit.com/comments/*"], "js": ["comments.js"], "run_at": "document_idle" }
+    {
+      "matches": ["*://*.reddit.com/comments/*", "*://*.reddit.com/gallery/*", "*://*.reddit.com/r/*/comments/*"],
+      "js": ["comments.js"],
+      "run_at": "document_idle"
+    }
   ]
 }
