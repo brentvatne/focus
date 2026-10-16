@@ -107,8 +107,11 @@ export interface Io {
   /** stderr is a terminal, so progress can redraw a single line instead of printing one per step. */
   stderrIsTerminal: boolean;
   sleep(ms: number): Promise<void>;
-  /** Watches for the Enter key; `pressed` never resolves without a terminal. Call `stop` when done. */
-  watchEnter(): { pressed: Promise<void>; stop(): void };
+  /**
+   * Reads one key without echoing it: Enter, Esc ("skip") or Ctrl-C ("interrupt"). `key` never
+   * resolves without a terminal. Call `stop` when done, which gives the terminal back.
+   */
+  readKey(): { key: Promise<Key>; stop(): void };
   /** Called after /etc/hosts itself (never any other file) has been rewritten. */
   flushDns(): Promise<void>;
   /** Asks which presets to block; resolves to their ids, or null if cancelled. Absent without a terminal. */
@@ -135,6 +138,11 @@ export interface Io {
 
 class UsageError extends Error {}
 
+/** Ctrl-C at one of focus's own prompts, where the terminal doesn't turn it into SIGINT. */
+class Interrupted extends Error {}
+
+export type Key = "enter" | "skip" | "interrupt";
+
 export async function run(argv: string[], io: Io): Promise<number> {
   // Chrome runs the native-messaging host with the calling extension's origin as its only argument.
   if (argv[0]?.startsWith("chrome-extension://")) return runNativeHost(io);
@@ -145,6 +153,7 @@ export async function run(argv: string[], io: Io): Promise<number> {
       io.stderr(`focus: ${error.message}\n\n${USAGE}\n`);
       return 2;
     }
+    if (error instanceof Interrupted) return 130;
     io.stderr(`focus: ${describeError(error)}\n`);
     return 1;
   }
@@ -416,15 +425,17 @@ async function reddit(args: string[], hostsPath: string, dryRun: boolean, io: Io
       const loaded = await chromeProfiles(io);
       const id = await readExtensionId(io.chrome.extensionDir).catch(() => null);
       const removed = await removeChromeFiles(io.chrome);
-      const opened = loaded.length > 0 && id !== null && (await io.chrome.openInChrome(`chrome://extensions/?id=${id}`).catch(() => false));
       io.stdout(
         (removed.length > 0 ? removed.map((file) => `Removed ${tildify(file, io.env.HOME)}\n`).join("") : "Nothing to remove.\n") +
-          (loaded.length > 0
-            ? `Chrome still lists "focus: allowed subreddits" (${profileNames(loaded)}); click Remove ${opened ? "on its details page, which is open" : "at chrome://extensions"}.\n`
-            : "") +
           `Your allowlist stays in ${tildify(path, io.env.HOME)}.\n` +
           "To block all of Reddit again: focus add reddit\n",
       );
+      if (loaded.length > 0 && id !== null) {
+        io.stdout(`\nChrome still lists "focus: allowed subreddits" (${profileNames(loaded)}); click Remove on its details page, chrome://extensions/?id=${id}.\n`);
+        if (io.stdoutIsTerminal && io.stderrIsTerminal && (await confirm("Press Enter to open it", io))) {
+          await io.chrome.openInChrome(`chrome://extensions/?id=${id}`).catch(() => false);
+        }
+      }
       return 0;
     }
     default:
@@ -479,31 +490,37 @@ async function finishChromeSetup(id: string, hostsPath: string, io: Io): Promise
   if (loaded.length > 0) {
     done(`Chrome already has it loaded (${profileNames(loaded)})`);
   } else {
-    const opened = await io.chrome.openInChrome("chrome://extensions/").catch(() => false);
-    await io.chrome.reveal(extensionDir).catch(() => {});
-    const copied = interactive && (await io.chrome.copyToClipboard(extensionDir).catch(() => false));
     io.stdout(
-      `\n${s.bold("Load it in Chrome")}${opened ? s.dim(" (chrome://extensions is open)") : ""}\n` +
-        `  1. ${opened ? "Turn on" : "Open chrome://extensions in Google Chrome and turn on"} ${s.bold("Developer mode")}, top right.\n` +
+      `\n${s.bold("Load it in Chrome")}\n` +
+        `  1. Open chrome://extensions and turn on ${s.bold("Developer mode")}, top right.\n` +
         `  2. Drag the ${s.bold("chrome-extension")} folder from Finder onto the page.\n` +
-        `     Or click ${s.bold("Load unpacked")}, press ⌘⇧G, ${copied ? "paste (the path is on your clipboard)" : `type ${shortPath}`}, then Return.\n`,
+        `     Or click ${s.bold("Load unpacked")}, press ⌘⇧G, paste this path and press Return:\n` +
+        `     ${shortPath}\n`,
     );
-    if (interactive) {
-      loaded = await waitForChrome("Waiting for Chrome to load it", io, async () => {
-        const found = await find();
-        return found.length > 0 ? found : null;
-      }) ?? [];
+    if (interactive && (await confirm("Press Enter to open chrome://extensions, show the folder in Finder and copy its path", io))) {
+      const opened = await io.chrome.openInChrome("chrome://extensions/").catch(() => false);
+      await io.chrome.reveal(extensionDir).catch(() => {});
+      const copied = await io.chrome.copyToClipboard(extensionDir).catch(() => false);
+      if (!opened) io.stdout(`  Chrome didn't open; open chrome://extensions in Google Chrome yourself.\n`);
+      if (!copied) io.stdout(`  Couldn't copy the path; it's ${shortPath}\n`);
+      loaded =
+        (await waitForChrome("Waiting for Chrome to load it", io, async () => {
+          const found = await find();
+          return found.length > 0 ? found : null;
+        })) ?? [];
       if (loaded.length > 0) done(`Chrome loaded it (${profileNames(loaded)})`);
     }
   }
 
   if (loaded.length > 0 && !loaded.some((profile) => profile.incognito)) {
-    const opened = await io.chrome.openInChrome(`chrome://extensions/?id=${id}`).catch(() => false);
     io.stdout(
-      `\n${s.bold("Allow it in Incognito")} ${s.dim(opened ? "(its details page is open; skip this if you don't use Incognito)" : "(skip this if you don't use Incognito)")}\n` +
-        `  Turn on ${s.bold("Allow in Incognito")}${opened ? "" : ` at chrome://extensions/?id=${id}`}.\n`,
+      `\n${s.bold("Allow it in Incognito")} ${s.dim("(skip this if you don't use Incognito)")}\n` +
+        `  Turn on ${s.bold("Allow in Incognito")} on the extension's details page${interactive ? "" : `, chrome://extensions/?id=${id}`}.\n`,
     );
-    if (interactive) {
+    if (interactive && (await confirm("Press Enter to open its details page", io))) {
+      if (!(await io.chrome.openInChrome(`chrome://extensions/?id=${id}`).catch(() => false))) {
+        io.stdout(`  Chrome didn't open; go to chrome://extensions/?id=${id} yourself.\n`);
+      }
       const allowed = await waitForChrome("Waiting for Incognito access", io, async () =>
         (await find()).some((profile) => profile.incognito) ? true : null,
       );
@@ -527,26 +544,43 @@ async function finishChromeSetup(id: string, hostsPath: string, io: Io): Promise
   io.stdout(`\n${s.dim("More, including how to undo it:")} ${hyperlink(links ? "the guide" : GUIDE_URL, GUIDE_URL, links)}\n`);
 }
 
+/** Asks before doing something outside the terminal. True for Enter, false for Esc. */
+async function confirm(prompt: string, io: Io): Promise<boolean> {
+  const s = styles(io.color);
+  io.stdout(`\n${prompt} ${s.dim("(Esc skips)")} `);
+  const reader = io.readKey();
+  try {
+    const key = await reader.key;
+    io.stdout(key === "skip" ? `${s.dim("skipped")}\n` : "\n");
+    if (key === "interrupt") throw new Interrupted();
+    return key === "enter";
+  } finally {
+    reader.stop();
+  }
+}
+
 /**
  * Polls `check` until it returns something other than null, with a spinner on stderr.
- * Enter or the time limit stops it early; resolves null then.
+ * Enter, Esc or the time limit stops it early; resolves null then.
  */
 async function waitForChrome<T>(label: string, io: Io, check: () => Promise<T | null>): Promise<T | null> {
   const status = statusLine(io);
-  const enter = io.watchEnter();
-  let skipped = false;
-  void enter.pressed.then(() => (skipped = true));
+  const reader = io.readKey();
+  let stopped: Key | null = null;
+  void reader.key.then((key) => (stopped = key));
   try {
-    for (let elapsed = 0, frame = 0; elapsed < CHROME_WAIT_MS && !skipped; elapsed += POLL_MS, frame++) {
+    for (let elapsed = 0, frame = 0; elapsed < CHROME_WAIT_MS; elapsed += POLL_MS, frame++) {
+      if (stopped === "interrupt") throw new Interrupted();
+      if (stopped) return null;
       const result = await check();
       if (result !== null) return result;
-      const hint = elapsed >= 3000 ? " (Chrome saves this within about 10 seconds; Enter skips)" : "";
+      const hint = elapsed >= 3000 ? " (Chrome saves this within about 10 seconds; Enter stops waiting)" : "";
       status.show({ step: "waiting", text: `${SPINNER[frame % SPINNER.length]} ${label}…${hint}` });
       await io.sleep(POLL_MS);
     }
     return null;
   } finally {
-    enter.stop();
+    reader.stop();
     status.clear();
   }
 }
@@ -955,21 +989,27 @@ if (import.meta.main) {
     stdoutIsTerminal: process.stdout.isTTY === true,
     stderrIsTerminal: process.stderr.isTTY === true,
     sleep: (ms) => Bun.sleep(ms),
-    watchEnter: () => {
-      if (!process.stdin.isTTY) return { pressed: new Promise<void>(() => {}), stop: () => {} };
+    readKey: () => {
+      const stdin = process.stdin;
+      if (!stdin.isTTY) return { key: new Promise<Key>(() => {}), stop: () => {} };
       let onData: (chunk: Buffer) => void = () => {};
-      const pressed = new Promise<void>((resolve) => {
+      const key = new Promise<Key>((resolve) => {
         onData = (chunk) => {
-          if (chunk.includes(10) || chunk.includes(13)) resolve();
+          if (chunk.includes(3)) resolve("interrupt");
+          else if (chunk.includes(13) || chunk.includes(10)) resolve("enter");
+          // A lone Esc; arrow keys and the like arrive as Esc plus more bytes.
+          else if (chunk.length === 1 && chunk[0] === 27) resolve("skip");
         };
       });
-      process.stdin.on("data", onData);
-      process.stdin.resume();
+      stdin.setRawMode(true);
+      stdin.on("data", onData);
+      stdin.resume();
       return {
-        pressed,
+        key,
         stop: () => {
-          process.stdin.off("data", onData);
-          process.stdin.pause();
+          stdin.off("data", onData);
+          stdin.setRawMode(false);
+          stdin.pause();
         },
       };
     },

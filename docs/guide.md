@@ -212,12 +212,12 @@ The hosts file can't do this itself. Every subreddit is a path on the same hostn
 focus reddit install
 ```
 
-This writes the extension to `~/Library/Application Support/focus/chrome-extension`, registers focus with Chrome, and walks you through the two steps only Chrome can do. It opens `chrome://extensions` in Chrome and shows the folder in Finder, then waits while you:
+This writes the extension to `~/Library/Application Support/focus/chrome-extension`, registers focus with Chrome, and walks you through the two steps only Chrome can do. Each step is explained first; press Enter and `install` opens what you need, or Esc to skip it:
 
-1. Turn on **Developer mode** and drag the `chrome-extension` folder onto the page. Or click **Load unpacked**, press ⌘⇧G and paste the path, which `install` copies to your clipboard.
-2. Turn on **Allow in Incognito** on the extension's details page, which `install` opens once Chrome has loaded it. Skip this if you don't use Incognito.
+1. **Load it.** Enter opens `chrome://extensions` in Chrome, shows the folder in Finder and copies its path. Turn on **Developer mode** and drag the `chrome-extension` folder onto the page, or click **Load unpacked**, press ⌘⇧G, paste and press Return.
+2. **Allow it in Incognito.** Once Chrome has loaded it, Enter opens the extension's details page; turn on **Allow in Incognito**. Skip this if you don't use Incognito.
 
-Each step gets a ✓ once Chrome has saved it, which takes up to about 10 seconds. Press Enter to stop waiting. If the extension is already loaded, `install` skips these steps, and `focus status` shows whether Chrome has it loaded and allowed in Incognito.
+After each step, `install` waits until Chrome has saved it, which takes up to about 10 seconds, and shows a ✓. Press Enter to stop waiting. If the extension is already loaded, `install` skips these steps, and `focus status` shows whether Chrome has it loaded and allowed in Incognito. Without a terminal, `install` only prints the steps and opens nothing.
 
 Then choose subreddits, and turn off the DNS block, which would otherwise stop every subreddit before Chrome sees it:
 
@@ -278,7 +278,7 @@ focus reddit uninstall           # removes the extension's folder and focus's re
 focus add reddit                 # blocks all of Reddit again
 ```
 
-If Chrome still has the extension loaded, `uninstall` opens its details page so you can click **Remove**. Your list stays in `~/.config/focus/subreddits.json`.
+If Chrome still has the extension loaded, `uninstall` offers to open its details page so you can click **Remove**. Your list stays in `~/.config/focus/subreddits.json`.
 
 ## Manual recovery
 

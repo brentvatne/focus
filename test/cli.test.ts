@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type Io, run } from "../src/cli.ts";
+import { type Io, type Key, run } from "../src/cli.ts";
 import { encodeMessage, readMessage } from "../src/nativehost.ts";
 import { UpgradeError, type UpgradeProgress } from "../src/upgrade.ts";
 import { VERSION } from "../src/version.ts";
@@ -50,8 +50,8 @@ async function focusWith(overrides: Partial<Io>, ...argv: string[]) {
     sleep: async () => {
       throw new Error("tests must stub sleep");
     },
-    watchEnter: () => {
-      throw new Error("tests must stub watchEnter");
+    readKey: () => {
+      throw new Error("tests must stub readKey");
     },
     flushDns: async () => void flushes++,
     upgrade: async () => {
@@ -1037,29 +1037,35 @@ describe("reddit", () => {
     return path;
   }
 
-  /** A terminal session where each poll is one sleep; `onSleep` plays Chrome by poll number. */
-  function terminal(onSleep: (call: number) => Promise<void> | void, enter = false) {
+  /**
+   * A terminal session. Each readKey call takes the next key from `keys` (null: never pressed,
+   * as while waiting), and each poll is one sleep, so `onSleep` can play Chrome by poll number.
+   */
+  function terminal(keys: (Key | null)[], onSleep: (call: number) => Promise<void> | void = () => {}) {
     let calls = 0;
+    const queue = [...keys];
     return {
       stdoutIsTerminal: true,
       stderrIsTerminal: true,
       sleep: async () => void (await onSleep(++calls)),
-      watchEnter: () => ({ pressed: enter ? Promise.resolve() : new Promise<void>(() => {}), stop: () => {} }),
+      readKey: () => {
+        const key = queue.shift() ?? null;
+        return { key: key ? Promise.resolve(key) : new Promise<Key>(() => {}), stop: () => {} };
+      },
+      polls: () => calls,
     };
   }
 
-  test("install writes the extension, registers the binary, and opens what Chrome needs", async () => {
+  test("install writes the extension and registers the binary, and without a terminal opens nothing", async () => {
     const fake = fakeChrome();
     const path = await binary();
     const result = await focusWith({ binaryPath: path, chrome: fake.chrome }, "reddit", "install");
     expect(result.code).toBe(0);
-    expect(fake.opened).toEqual(["chrome://extensions/"]);
-    expect(fake.revealed).toEqual([fake.chrome.extensionDir]);
-    // Not in a terminal: the clipboard is left alone and nothing waits.
-    expect(fake.copied).toEqual([]);
+    expect([fake.opened, fake.revealed, fake.copied]).toEqual([[], [], []]);
     expect(result.stdout).toContain(`✓ Wrote the extension to ${fake.chrome.extensionDir}\n✓ Registered focus with Chrome\n`);
-    expect(result.stdout).toContain("Load it in Chrome (chrome://extensions is open)");
-    expect(result.stdout).toContain(`Load unpacked, press ⌘⇧G, type ${fake.chrome.extensionDir}, then Return.`);
+    expect(result.stdout).toContain("1. Open chrome://extensions and turn on Developer mode, top right.");
+    expect(result.stdout).toContain(`Load unpacked, press ⌘⇧G, paste this path and press Return:\n     ${fake.chrome.extensionDir}\n`);
+    expect(result.stdout).not.toContain("Press Enter");
     expect(result.stdout).toContain("focus reddit allow <name...>  choose the subreddits to keep");
     expect(result.stdout).toContain("focus status                  check that Chrome has loaded it");
     expect(result.stdout).not.toContain("\x1b");
@@ -1073,26 +1079,22 @@ describe("reddit", () => {
     });
   });
 
-  test("install tells you to open chrome://extensions yourself when Chrome can't be opened", async () => {
+  test("in a terminal, install asks before opening anything, then waits for each step", async () => {
     const fake = fakeChrome();
-    const chrome = { ...fake.chrome, openInChrome: async () => false };
-    const result = await focusWith({ binaryPath: await binary(), chrome }, "reddit", "install");
-    expect(result.stdout).toContain("Load it in Chrome\n  1. Open chrome://extensions in Google Chrome and turn on Developer mode");
-  });
-
-  test("in a terminal, install waits for Chrome to load it, then for Incognito access", async () => {
-    const fake = fakeChrome();
-    const session = terminal(async (call) => {
+    const session = terminal(["enter", null, "enter", null], async (call) => {
       if (call === 3) await fake.saveProfile(false);
       if (call === 5) await fake.saveProfile(true);
     });
     const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome, ...session }, "reddit", "install");
     expect(result.code).toBe(0);
-    expect(fake.copied).toEqual([fake.chrome.extensionDir]);
     expect(fake.opened).toEqual(["chrome://extensions/", `chrome://extensions/?id=${ID}`]);
-    expect(result.stdout).toContain("press ⌘⇧G, paste (the path is on your clipboard), then Return.");
+    expect(fake.revealed).toEqual([fake.chrome.extensionDir]);
+    expect(fake.copied).toEqual([fake.chrome.extensionDir]);
+    expect(result.stdout).toContain(
+      "\nPress Enter to open chrome://extensions, show the folder in Finder and copy its path (Esc skips) \n",
+    );
     expect(result.stdout).toContain("✓ Chrome loaded it (profile Person 1)\n");
-    expect(result.stdout).toContain("Allow it in Incognito (its details page is open; skip this if you don't use Incognito)");
+    expect(result.stdout).toContain("\nPress Enter to open its details page (Esc skips) \n");
     expect(result.stdout).toContain("✓ Allowed in Incognito\n");
     expect(result.stdout).not.toContain("focus status");
     expect(result.stderr).toContain("⠙ Waiting for Chrome to load it…");
@@ -1100,20 +1102,49 @@ describe("reddit", () => {
     expect(result.stderr).toEndWith("\r\x1b[K");
   });
 
-  test("Enter stops waiting, and the steps still print", async () => {
+  test("Esc skips a step without opening anything or waiting", async () => {
     const fake = fakeChrome();
-    const session = terminal(() => {}, true);
+    const session = terminal(["skip"]);
     const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome, ...session }, "reddit", "install");
     expect(result.code).toBe(0);
+    expect([fake.opened, fake.revealed, fake.copied]).toEqual([[], [], []]);
+    expect(result.stdout).toContain("(Esc skips) skipped\n");
+    expect(result.stdout).toContain("check that Chrome has loaded it");
+    expect(session.polls()).toBe(0);
+  });
+
+  test("Enter stops waiting, and the remaining steps still print", async () => {
+    const fake = fakeChrome();
+    const session = terminal(["enter", "enter"]);
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome, ...session }, "reddit", "install");
+    expect(result.code).toBe(0);
+    expect(fake.opened).toEqual(["chrome://extensions/"]);
     expect(result.stdout).not.toContain("✓ Chrome loaded it");
     expect(result.stdout).toContain("check that Chrome has loaded it");
+  });
+
+  test("Ctrl-C at a prompt stops install with nothing opened", async () => {
+    const fake = fakeChrome();
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome, ...terminal(["interrupt"]) }, "reddit", "install");
+    expect(result.code).toBe(130);
+    expect(fake.opened).toEqual([]);
+    expect(result.stdout).not.toContain("skipped");
+    expect(result.stdout).not.toContain("Then");
+  });
+
+  test("says so when Chrome can't be opened or the path can't be copied", async () => {
+    const fake = fakeChrome();
+    const chrome = { ...fake.chrome, openInChrome: async () => false, copyToClipboard: async () => false };
+    const result = await focusWith({ binaryPath: await binary(), chrome, ...terminal(["enter", "enter"]) }, "reddit", "install");
+    expect(result.stdout).toContain("Chrome didn't open; open chrome://extensions in Google Chrome yourself.");
+    expect(result.stdout).toContain(`Couldn't copy the path; it's ${fake.chrome.extensionDir}`);
   });
 
   test("install skips the Chrome steps when Chrome already has it", async () => {
     const fake = fakeChrome();
     await fake.saveProfile(true, "Profile 2", "Work");
     await Bun.write(allowlist(), '{"version":1,"allow":["rust"]}');
-    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "reddit", "install");
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome, ...terminal([]) }, "reddit", "install");
     expect(result.stdout).toContain("✓ Chrome already has it loaded (profile Work)\n");
     expect(result.stdout).not.toContain("Load it in Chrome");
     expect(result.stdout).not.toContain("Incognito");
@@ -1121,11 +1152,18 @@ describe("reddit", () => {
     expect(fake.opened).toEqual([]);
   });
 
+  test("without a terminal, the Incognito step names the details page", async () => {
+    const fake = fakeChrome();
+    await fake.saveProfile(false);
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "reddit", "install");
+    expect(result.stdout).toContain(`Turn on Allow in Incognito on the extension's details page, chrome://extensions/?id=${ID}.`);
+    expect(fake.opened).toEqual([]);
+  });
+
   test("install links the folder and the guide in terminals that support links", async () => {
     const fake = fakeChrome();
     const env = { FOCUS_HOSTS_FILE: hostsFile, FOCUS_CONFIG: configFile, TERM_PROGRAM: "iTerm.app" };
-    const session = terminal(() => {}, true);
-    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome, env, ...session }, "reddit", "install");
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome, env, ...terminal(["skip"]) }, "reddit", "install");
     expect(result.stdout).toContain(`\x1b]8;;file://${fake.chrome.extensionDir}\x1b\\${fake.chrome.extensionDir}\x1b]8;;\x1b\\`);
     expect(result.stdout).toContain("\x1b]8;;https://github.com/brentvatne/focus/blob/main/docs/guide.md#allowing-subreddits-chrome\x1b\\the guide");
   });
@@ -1155,17 +1193,24 @@ describe("reddit", () => {
     expect((await focusWith({ chrome: fake.chrome }, "status")).stdout).toContain("Extension:  not loaded in Chrome");
   });
 
-  test("uninstall removes the files and opens Chrome's page to remove it there", async () => {
+  test("uninstall removes the files, then offers to open Chrome's page to remove it there", async () => {
     const fake = fakeChrome();
     await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "reddit", "install");
     await fake.saveProfile(true);
-    fake.opened.length = 0;
-    const uninstalled = await focusWith({ chrome: fake.chrome }, "reddit", "uninstall");
-    expect(uninstalled.stdout).toContain(`Removed ${fake.chrome.extensionDir}`);
-    expect(uninstalled.stdout).toContain(`Chrome still lists "focus: allowed subreddits" (profile Person 1); click Remove on its details page, which is open.`);
-    expect(fake.opened).toEqual([`chrome://extensions/?id=${ID}`]);
+    const plain = await focusWith({ chrome: fake.chrome }, "reddit", "uninstall");
+    expect(plain.stdout).toContain(`Removed ${fake.chrome.extensionDir}`);
+    expect(plain.stdout).toContain(
+      `Chrome still lists "focus: allowed subreddits" (profile Person 1); click Remove on its details page, chrome://extensions/?id=${ID}.`,
+    );
+    expect(fake.opened).toEqual([]);
     expect(await readdir(dir)).not.toContain("chrome-extension");
     expect(await readdir(fake.chrome.nativeHostsDir)).toEqual([]);
+
+    // Chrome keeps listing it until it's removed there; in a terminal, uninstall offers to open the page.
+    await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "reddit", "install");
+    const asked = await focusWith({ chrome: fake.chrome, ...terminal(["enter"]) }, "reddit", "uninstall");
+    expect(asked.stdout).toContain("Press Enter to open it (Esc skips) \n");
+    expect(fake.opened).toEqual([`chrome://extensions/?id=${ID}`]);
     expect((await focusWith({ chrome: fake.chrome }, "reddit", "uninstall")).stdout).toContain("Nothing to remove");
   });
 
