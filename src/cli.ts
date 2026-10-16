@@ -26,12 +26,13 @@ import { promptForPresets } from "./prompt.ts";
 import { UpgradeError, type UpgradeResult, upgrade } from "./upgrade.ts";
 import { VERSION } from "./version.ts";
 
-const USAGE = `Usage: focus <command> [options]
+const USAGE = `Usage: focus [command] [options]
 
 Block distracting websites by managing a marked section of /etc/hosts.
 
 Commands:
-  init [preset...]        Choose which presets to block. Without names, shows a checklist;
+  (none)                  Toggle blocking: on if it's off, off if it's on
+  init [preset...]      Choose which presets to block. Without names, shows a checklist;
                           names set the list exactly. Presets: ${PRESETS.map((p) => p.id).join(", ")}
   add <host...>           Block hostnames (also blocks www.<host> unless --exact)
   add --preset <id...>    Turn presets on
@@ -130,7 +131,7 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
     io.stdout(VERSION + "\n");
     return 0;
   }
-  if (values.help || command === undefined || command === "help") {
+  if (values.help || command === "help") {
     io.stdout(USAGE + "\n");
     return 0;
   }
@@ -174,7 +175,12 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
   if (io.isRoot && !targetsSystemHosts) {
     throw new UsageError(`as root, focus only manages ${io.systemHostsFile}; --hosts-file and FOCUS_HOSTS_FILE can't point elsewhere`);
   }
-  if (!io.isRoot && targetsSystemHosts && MUTATING_COMMANDS.has(command) && !values["dry-run"]) {
+  // A bare `focus` with nothing to toggle shows help instead of asking sudo for nothing.
+  if (command === undefined && !readSection((await readHostsFile(hostsPath)).content)) {
+    io.stdout(USAGE + "\n");
+    return 0;
+  }
+  if (!io.isRoot && targetsSystemHosts && (command === undefined || MUTATING_COMMANDS.has(command)) && !values["dry-run"]) {
     return elevate(argv, io);
   }
 
@@ -220,7 +226,7 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
   }
 
   if (values["dry-run"]) {
-    const diff = unifiedDiff(snapshot.content, updated, snapshot.path, `${snapshot.path} (after focus ${command})`);
+    const diff = unifiedDiff(snapshot.content, updated, snapshot.path, `${snapshot.path} (after focus${command ? ` ${command}` : ""})`);
     io.stdout(io.color ? colorizeDiff(diff) : diff);
     io.stdout(`\nDry run: ${snapshot.path} was not modified.\n`);
     return 0;
@@ -300,7 +306,7 @@ async function isWritable(path: string): Promise<boolean> {
 }
 
 function planChange(
-  command: string,
+  command: string | undefined,
   args: string[],
   current: FocusSection | null,
   options: { exact: boolean; preset: boolean },
@@ -358,6 +364,8 @@ function planChange(
       }
       return { ...current, state: command };
     }
+    case undefined:
+      return current && { ...current, state: current.state === "on" ? "off" : "on" };
     case "sync":
       if (args.length > 0) throw new UsageError("sync takes no arguments");
       return current;

@@ -5,7 +5,7 @@ This file covers what you need to know to work on focus. User documentation is s
 ## What this is
 
 focus is a macOS CLI written in Bun and TypeScript. It blocks websites by managing one marked section of `/etc/hosts`.
-- **Commands:** `init`, `add`, `remove`/`rm` (both also take `--preset`), `on`, `off`, `status`, `sync`, `upgrade`/`self-update`, `setup-sudo` and `version`.
+- **Commands:** `init`, `add`, `remove`/`rm` (both also take `--preset`), `on`, `off`, `status`, `sync`, `upgrade`/`self-update`, `setup-sudo` and `version`. `focus` with no command toggles `on`/`off`, or shows help when nothing is listed.
 - **Distribution:** a self-contained, ad-hoc-signed arm64 binary, published as GitHub releases from the public repo `brentvatne/focus`.
 - **v1 scope:** v1 must stay reversible. It deliberately has no timers, daemons, schedules or anti-tampering features. Don't add these unless asked.
 

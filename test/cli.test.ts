@@ -167,6 +167,28 @@ describe("on / off / status", () => {
     );
   });
 
+  test("focus on its own toggles blocking", async () => {
+    await focus("add", "a.com");
+    const blocked = await read();
+
+    expect((await focus()).code).toBe(0);
+    expect((await focus("status")).stdout).toContain("Blocking:   off");
+    expect((await focus()).code).toBe(0);
+    expect(await read()).toBe(blocked);
+  });
+
+  test("focus on its own shows help when nothing is listed", async () => {
+    const result = await focus();
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("Usage: focus");
+    expect(await read()).toBe(ORIGINAL);
+  });
+
+  test("focus on its own refuses --preset", async () => {
+    await focus("add", "a.com");
+    expect((await focus("--preset")).code).toBe(2);
+  });
+
   test("on with nothing listed changes nothing", async () => {
     const result = await focus("on");
     expect(result.code).toBe(0);
@@ -194,6 +216,14 @@ describe("--dry-run", () => {
     expect((await stat(hostsFile)).mtimeMs).toBe(before.mtimeMs);
     expect(await readdir(dir)).toEqual(["hosts"]);
     expect(result.flushes).toBe(0);
+  });
+
+  test("-n works for a bare toggle", async () => {
+    await focus("add", "--exact", "a.com");
+    const result = await focus("-n");
+    expect(result.stdout).toContain(`+++ ${hostsFile} (after focus)\n`);
+    expect(result.stdout).toContain("+# 0.0.0.0 a.com\n");
+    expect((await focus("status")).stdout).toContain("Blocking:   on");
   });
 
   test("-n works for off", async () => {
@@ -524,6 +554,17 @@ describe("running without typing sudo", () => {
     expect(calls).toEqual([["add", "--exact", "a.com"]]);
     expect(result.stderr).toContain("Run `focus setup-sudo` once to skip the password");
     expect(await read()).toBe(ORIGINAL);
+  });
+
+  test("asks sudo to toggle, but not when there's nothing to toggle", async () => {
+    const calls: string[][] = [];
+    const elevate = async (argv: string[]) => (calls.push(argv), 0);
+    expect((await focusWith(asSystem({ elevate }))).stdout).toContain("Usage: focus");
+    expect(calls).toEqual([]);
+
+    await focusWith(asSystem({ isRoot: true }), "add", "a.com");
+    expect((await focusWith(asSystem({ elevate }), "--no-flush")).code).toBe(0);
+    expect(calls).toEqual([["--no-flush"]]);
   });
 
   test("passes sudo's exit code through", async () => {

@@ -53,6 +53,7 @@ focus add --exact news.example.com
 focus remove example.com           # also removes www.example.com unless --exact
 focus off                          # stop blocking but keep the list
 focus on                           # start blocking again
+focus                              # toggle: off if it's on, on if it's off
 focus sync                         # update presets to this version's hostnames
 focus status                            # read-only
 ```
