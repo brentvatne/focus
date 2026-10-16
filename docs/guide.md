@@ -46,8 +46,8 @@ The build step re-signs the binary because macOS kills Bun's compiled output (ex
 
 ```bash
 focus init                         # choose preset site groups from a checklist (see below)
-focus add --preset instagram       # turn one preset on…
-focus remove --preset instagram    # …or off
+focus add instagram                # turn one preset on…
+focus remove instagram             # …or off
 focus add example.com              # also blocks www.example.com
 focus add --exact news.example.com
 focus remove example.com           # also removes www.example.com unless --exact
@@ -70,7 +70,7 @@ focus add -n twitter.com
 | Option | Meaning |
 | --- | --- |
 | `-y`, `--yes` | `init` only: keep the current presets without prompting (on a fresh install, use the recommended ones) |
-| `--preset` | `add`/`remove` only: the arguments are preset names, not hostnames |
+| `--preset` | `add`/`remove` only: treat every argument as a preset name. Rarely needed, because a single word already means a preset. |
 | `-n`, `--dry-run` | Print the diff and don't write anything |
 | `--exact` / `--no-exact` | Don't (or do) add or remove the `www.` variant. The default comes from the config file, or is `--no-exact`. |
 | `--hosts-file <path>` | Manage a different file. You can also set `FOCUS_HOSTS_FILE`. The default is `/etc/hosts`. |
@@ -107,7 +107,8 @@ focus add -n twitter.com
 - **Messenger is separate from Facebook,** so you can block Facebook and still use messenger.com. Shared CDNs such as `fbcdn.net`, `ytimg.com` and `googlevideo.com` are never blocked, which keeps embeds and Messenger's assets loading. `music.youtube.com` also stays reachable.
 - **Presets add exact hostnames.** The `www.` expansion and `exact` don't apply to them.
 - **Presets follow new versions.** focus records which presets you chose (`# preset: <name>` in the hosts file) rather than just copying their hostnames. Whenever it writes the file, it rebuilds each preset from the running version's list. So when a preset gains a hostname, as X did with `api.x.com`, you get it after `focus upgrade` or any other change. Hostnames a preset drops are removed the same way. Sites you added yourself are never touched.
-- **One preset is all or nothing.** `focus remove api.x.com` refuses and points you to `focus remove --preset x`. Adding a hostname that a preset already covers is a no-op.
+- **One preset at a time:** `focus add instagram` and `focus remove instagram` turn a single preset on or off, and can be mixed with hostnames (`focus add tiktok example.com`). Hostnames always contain a dot, so a single word is always read as a preset. A word that isn't one is an error, with a suggestion when it looks like a typo or another name for one (`youtub` → `youtube`, `twitter` → `x`); nothing is changed.
+- **One preset is all or nothing.** `focus remove api.x.com` refuses and points you to `focus remove x`. Adding a hostname that a preset already covers is a no-op.
 - **Without a prompt:** `focus init x youtube` sets your presets to exactly the named ones, and `focus init --yes` keeps the current ones (or picks the recommended ones on a fresh install). Use one of these in scripts; `init` with neither stops with an error when there's no terminal.
 - **Upgrading from 0.1.0:** 0.1.0 didn't record presets. The first time a newer version writes the file, any preset whose 0.1.0 hostnames are all present is recorded as that preset; everything else is kept as your own sites.
 
@@ -221,10 +222,10 @@ Then choose subreddits, and turn off the DNS block, which would otherwise stop e
 
 ```bash
 focus reddit allow rust AskHistorians    # also accepts r/rust or a subreddit URL
-focus remove --preset reddit
+focus remove reddit
 ```
 
-Check that an allowed subreddit loads and another one shows focus's blocked page. If it doesn't, `focus add --preset reddit` blocks all of Reddit again.
+Check that an allowed subreddit loads and another one shows focus's blocked page. If it doesn't, `focus add reddit` blocks all of Reddit again.
 
 ### Day to day
 
@@ -268,7 +269,7 @@ While focus is on:
 
 ```bash
 focus reddit uninstall           # removes the extension's folder and focus's registration with Chrome
-focus add --preset reddit        # blocks all of Reddit again
+focus add reddit                 # blocks all of Reddit again
 ```
 
 Then remove "focus: allowed subreddits" at `chrome://extensions`. Your list stays in `~/.config/focus/subreddits.json`.

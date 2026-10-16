@@ -31,7 +31,15 @@ import {
   sudoersRule,
 } from "./sudo.ts";
 import { NativeMessageError, blocksReddit, encodeMessage, readMessage, respond } from "./nativehost.ts";
-import { PRESETS, type Preset, findPreset, presetBlocking, syncSection, withPresets } from "./presets.ts";
+import {
+  PRESETS,
+  type Preset,
+  findPreset,
+  presetBlocking,
+  suggestPresets,
+  syncSection,
+  withPresets,
+} from "./presets.ts";
 import { promptForPresets } from "./prompt.ts";
 import {
   MAX_SUBREDDITS,
@@ -52,10 +60,8 @@ Commands:
   (none)                  Toggle blocking: on if it's off, off if it's on
   init [preset...]      Choose which presets to block. Without names, shows a checklist;
                           names set the list exactly. Presets: ${PRESETS.map((p) => p.id).join(", ")}
-  add <host...>           Block hostnames (also blocks www.<host> unless --exact)
-  add --preset <id...>    Turn presets on
-  remove <host...>        Unblock hostnames (also unblocks www.<host> unless --exact)
-  remove --preset <id...> Turn presets off
+  add <host|preset...>    Block hostnames (and www.<host> unless --exact), or turn presets on
+  remove <host|preset...> Unblock hostnames (and www.<host> unless --exact), or turn presets off
   on                      Turn blocking on for everything listed
   off                     Turn blocking off but keep the list
   status                  Show whether blocking is on and what's listed
@@ -72,7 +78,7 @@ Commands:
 Options:
   -n, --dry-run          Print a diff of the hosts file instead of writing it
   -y, --yes              init: keep the current presets (or the recommended ones) without prompting
-      --preset           add/remove: the arguments are preset names, not hostnames
+      --preset           add/remove: treat every argument as a preset name
       --[no-]exact       Don't add or remove the www. variant (default: false)
       --hosts-file <path> Hosts file to manage (default: $FOCUS_HOSTS_FILE or /etc/hosts)
       --[no-]flush       Flush the macOS DNS cache after writing (default: true)
@@ -392,9 +398,9 @@ async function reddit(args: string[], hostsPath: string, dryRun: boolean, io: Io
           `  3. Click Details on "focus: allowed subreddits" and turn on "Allow in Incognito".\n\n` +
           "Then:\n" +
           "  focus reddit allow <name>       for each subreddit you want\n" +
-          "  focus remove --preset reddit    the hosts file would otherwise block all of Reddit\n" +
+          "  focus remove reddit             the hosts file would otherwise block all of Reddit\n" +
           "Check that an allowed subreddit loads and another shows focus's blocked page. If it\n" +
-          "doesn't, `focus add --preset reddit` blocks all of Reddit again.\n",
+          "doesn't, `focus add reddit` blocks all of Reddit again.\n",
       );
       await io.chrome.openFolder(extensionDir).catch(() => {});
       return 0;
@@ -405,7 +411,7 @@ async function reddit(args: string[], hostsPath: string, dryRun: boolean, io: Io
       io.stdout(
         (removed.length > 0 ? removed.map((file) => `Removed ${file}\n`).join("") : "Nothing to remove.\n") +
           `Remove "focus: allowed subreddits" at chrome://extensions too. Your allowlist stays in ${path}.\n` +
-          "To block all of Reddit again: focus add --preset reddit\n",
+          "To block all of Reddit again: focus add reddit\n",
       );
       return 0;
     }
@@ -443,7 +449,7 @@ async function warnAboutRedditSetup(hostsPath: string, io: Io): Promise<void> {
   } else if (blocksReddit(section)) {
     io.stderr(
       "focus: the hosts file still blocks all of Reddit while focus is on. Once the Chrome extension works,\n" +
-        "run `focus remove --preset reddit` so the allowed subreddits can load.\n",
+        "run `focus remove reddit` so the allowed subreddits can load.\n",
     );
   }
   if (!(await isDirectory(io.chrome.extensionDir))) {
@@ -516,40 +522,36 @@ function planChange(
 
   switch (command) {
     case "add": {
-      if (options.preset) {
-        const ids = parsePresetIds(args, command);
-        for (const id of ids) if (enabled.includes(id)) io.stderr(`focus: the ${id} preset is already on\n`);
-        return withPresets(current, [...enabled, ...ids]);
-      }
+      const { ids, hosts } = options.preset ? { ids: parsePresetIds(args, command), hosts: [] } : parseTargets(args, command);
+      for (const id of ids) if (enabled.includes(id)) io.stderr(`focus: the ${id} preset is already on\n`);
+      // Presets first, so a host that a newly added preset covers is reported as covered.
+      const next = ids.length > 0 ? withPresets(current, [...enabled, ...ids]) : current;
       const added: string[] = [];
-      for (const host of expand(parseHostnames(args, command), options.exact)) {
-        const preset = presetBlocking(current, host);
+      for (const host of expand(hosts, options.exact)) {
+        const preset = presetBlocking(next, host);
         if (preset) io.stderr(`focus: ${host} is already blocked by the ${preset.name} preset\n`);
         else if (sites.includes(host)) io.stderr(`focus: ${host} is already listed\n`);
         else added.push(host);
       }
-      return { state: current?.state ?? "on", presets: current?.presets ?? [], sites: [...sites, ...added] };
+      return { state: next?.state ?? "on", presets: next?.presets ?? [], sites: [...(next?.sites ?? []), ...added] };
     }
     case "remove":
     case "rm": {
-      if (options.preset) {
-        const ids = parsePresetIds(args, command);
-        for (const id of ids) if (!enabled.includes(id)) io.stderr(`focus: the ${id} preset isn't on\n`);
-        return current && withPresets(current, enabled.filter((id) => !ids.includes(id)));
-      }
-      const requested = parseHostnames(args, command);
-      for (const host of requested) {
-        const preset = presetBlocking(current, host);
+      const { ids, hosts } = options.preset ? { ids: parsePresetIds(args, command), hosts: [] } : parseTargets(args, command);
+      for (const id of ids) if (!enabled.includes(id)) io.stderr(`focus: the ${id} preset isn't on\n`);
+      const next = current && ids.length > 0 ? withPresets(current, enabled.filter((id) => !ids.includes(id))) : current;
+      for (const host of hosts) {
+        const preset = presetBlocking(next, host);
         if (preset) {
           io.stderr(
-            `focus: ${host} is blocked by the ${preset.name} preset; to unblock it, run \`focus remove --preset ${preset.id}\`\n`,
+            `focus: ${host} is blocked by the ${preset.name} preset; to unblock it, run \`focus remove ${preset.id}\`\n`,
           );
-        } else if (!sites.includes(host)) {
+        } else if (!next?.sites.includes(host)) {
           io.stderr(`focus: ${host} is not listed\n`);
         }
       }
-      const hosts = expand(requested, options.exact);
-      return current && { ...current, sites: sites.filter((host) => !hosts.includes(host)) };
+      const removed = expand(hosts, options.exact);
+      return next && { ...next, sites: next.sites.filter((host) => !removed.includes(host)) };
     }
     case "on":
     case "off": {
@@ -588,31 +590,52 @@ async function choosePresets(
 }
 
 function parsePresetIds(args: string[], command: string): string[] {
-  if (args.length === 0) throw new UsageError(`${command} --preset needs at least one preset name`);
+  if (args.length === 0) throw new UsageError(`${command} needs at least one preset name`);
   const unknown = args.filter((id) => !findPreset(id));
-  if (unknown.length > 0) {
-    throw new UsageError(
-      `unknown preset ${unknown.map((id) => `'${id}'`).join(", ")}; choose from: ${PRESETS.map((p) => p.id).join(", ")}`,
-    );
-  }
+  if (unknown.length > 0) throw new UsageError(unknown.map(unknownPreset).join("\n"));
   return [...new Set(args.map((id) => findPreset(id)!.id))];
 }
 
-function parseHostnames(args: string[], command: string): string[] {
-  if (args.length === 0) throw new UsageError(`${command} needs at least one hostname`);
+function unknownPreset(name: string): string {
+  const suggestions = suggestPresets(name);
+  return suggestions.length > 0
+    ? `unknown preset '${name}'; did you mean ${suggestions.map((preset) => `'${preset.id}'`).join(" or ")}?`
+    : `unknown preset '${name}'; choose from: ${PRESETS.map((preset) => preset.id).join(", ")}`;
+}
+
+/**
+ * Splits add/remove arguments into presets and hostnames. Hostnames always contain a
+ * dot, so a single word can only mean a preset; one that isn't a preset is an error,
+ * with a suggestion when it looks like a typo.
+ */
+function parseTargets(args: string[], command: string): { ids: string[]; hosts: string[] } {
+  if (args.length === 0) throw new UsageError(`${command} needs at least one hostname or preset`);
   const errors: string[] = [];
+  const ids: string[] = [];
   const hosts: string[] = [];
   for (const arg of args) {
+    const preset = findPreset(arg);
+    if (preset) {
+      if (!ids.includes(preset.id)) ids.push(preset.id);
+      continue;
+    }
     try {
       const host = normalizeHostname(arg);
       if (!hosts.includes(host)) hosts.push(host);
     } catch (error) {
       if (!(error instanceof InvalidHostnameError)) throw error;
-      errors.push(error.message);
+      if (!/^[\p{L}\p{N}_-]+$/u.test(arg.trim())) errors.push(error.message);
+      else if (suggestPresets(arg).length > 0) errors.push(unknownPreset(arg));
+      else {
+        errors.push(
+          `'${arg}' isn't a preset or a hostname; presets are ${PRESETS.map((p) => p.id).join(", ")}, ` +
+            `and hostnames need a domain, e.g. '${arg.trim().toLowerCase()}.com'`,
+        );
+      }
     }
   }
   if (errors.length > 0) throw new UsageError(errors.join("\n"));
-  return hosts;
+  return { ids, hosts };
 }
 
 function expand(hosts: string[], exact: boolean): string[] {
