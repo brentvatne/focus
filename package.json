@@ -1,6 +1,6 @@
 {
   "name": "focus",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Block distracting websites on macOS by managing a marked section of /etc/hosts",
   "type": "module",
   "private": true,
