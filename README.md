@@ -23,6 +23,7 @@ focus init               # choose presets: X, Facebook, YouTube, Reddit, …
 focus add example.com    # block anything else
 focus                    # toggle blocking on or off
 focus off                # take a break; `focus on` to resume
+focus reddit allow rust  # keep chosen subreddits in Chrome (setup in the guide)
 focus status
 focus upgrade
 ```

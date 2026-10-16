@@ -26,5 +26,7 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  // The Chrome extension has its own tsconfig with DOM and chrome.* types.
+  "exclude": ["extension", "dist", "node_modules"]
 }

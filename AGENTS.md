@@ -5,7 +5,8 @@ This file covers what you need to know to work on focus. User documentation is s
 ## What this is
 
 focus is a macOS CLI written in Bun and TypeScript. It blocks websites by managing one marked section of `/etc/hosts`.
-- **Commands:** `init`, `add`, `remove`/`rm` (both also take `--preset`), `on`, `off`, `status`, `sync`, `upgrade`/`self-update`, `setup-sudo` and `version`. `focus` with no command toggles `on`/`off`, or shows help when nothing is listed.
+- **Commands:** `init`, `add`, `remove`/`rm` (both also take `--preset`), `on`, `off`, `status`, `sync`, `reddit allow|disallow|list|install|uninstall`, `upgrade`/`self-update`, `setup-sudo` and `version`. `focus` with no command toggles `on`/`off`, or shows help when nothing is listed.
+- **Allowed subreddits:** a Chrome extension in `extension/` blocks Reddit except an allowlist while focus is on. The focus binary is its native-messaging host. It's a separate component from the hosts file; see the guide's "Allowing subreddits (Chrome)".
 - **Distribution:** a self-contained, ad-hoc-signed arm64 binary, published as GitHub releases from the public repo `brentvatne/focus`.
 - **v1 scope:** v1 must stay reversible. It deliberately has no timers, daemons, schedules or anti-tampering features. Don't add these unless asked.
 
@@ -14,7 +15,7 @@ focus is a macOS CLI written in Bun and TypeScript. It blocks websites by managi
 ```bash
 bun install
 bun test               # all tests, about 0.1 seconds
-bun run typecheck      # tsc --noEmit; also covers scripts/ and test/
+bun run typecheck      # tsc --noEmit (src, scripts, test), then extension/ with its own tsconfig
 bun run build          # dev binary at dist/focus (signed)
 bun run build:release  # dist/release/focus-darwin-arm64 + SHA256SUMS (what CI publishes)
 bun src/cli.ts --hosts-file /tmp/some-copy status   # run from source against a copy
@@ -30,13 +31,13 @@ Use Bun, not Node: run with `bun`, test with `bun:test`, use `Bun.file`/`Bun.wri
    - a `flushDns` spy;
    - an `upgrade` stub that throws.
 
-   It also sets `isRoot: false`, a `systemHostsFile` path inside the temp dir that doesn't exist, and `elevate`/`sudoers` stubs that throw.
+   It also sets `isRoot: false`, a `systemHostsFile` path inside the temp dir that doesn't exist, and `elevate`/`sudoers` stubs that throw. `chrome` points the subreddit allowlist, the extension folder and Chrome's `NativeMessagingHosts` folder into the temp dir, with an `openFolder` stub that throws, and `nativeMessaging` has stubs that throw.
 
-   Keep all of these. A test that drops one could reach `/etc/hosts`, your real `~/.config/focus/config.json`, GitHub or sudo. Tests that exercise root behaviour point `systemHostsFile` at the temp hosts file instead of the real one.
+   Keep all of these. A test that drops one could reach `/etc/hosts`, your real `~/.config/focus/config.json` or `~/Library`, GitHub or sudo. Tests that exercise root behaviour point `systemHostsFile` at the temp hosts file instead of the real one.
 3. **Never run real sudo from an agent session.** That includes the elevation path, because a cached sudo login would let it rewrite the real `/etc/hosts`. If you must check that the elevation path is wired up, first confirm `/usr/bin/sudo -n true` fails, then run with stdin redirected from `/dev/null`, so sudo refuses before anything runs as root.
 4. **Lines outside the managed section are sacred.** Unrelated content must stay byte-for-byte identical, including CRLF line endings and a missing final newline. Removing the last site must restore the original file exactly. `test/hosts.test.ts` asserts all of this.
 5. **Refuse rather than guess.** If the section is malformed (duplicate or missing markers, lines focus didn't write, invalid hostnames), throw `HostsFormatError` and change nothing. The "Manual recovery" sections in the README and the guide are the escape hatch, so keep both accurate whenever the marker format changes. The error message points to the README's heading, so don't rename it.
-6. **The hosts file is the only state.** The block list and on/off state live inside the section. Don't add a database or state file, and don't copy the list into the config file.
+6. **The hosts file is the only state** for hosts-file blocking. The block list and on/off state live inside the section. Don't add a database or state file, and don't copy the list into the config file. The one exception is the Chrome extension's subreddit allowlist (see the design decisions); it never holds hosts-file state.
 
 ## Layout
 
@@ -53,6 +54,10 @@ Use Bun, not Node: run with `bun`, test with `bun:test`, use `Bun.file`/`Bun.wri
 | `src/sudo.ts` | `setup-sudo` itself. It covers the rule text (strict username and path patterns, so nothing needs sudoers escaping) and `checkBinaryIsSafe` (the binary and every parent directory must be owned by root and not group- or other-writable). Installing validates the temp file with `visudo` before renaming it into place, then verifies the result with `sudo -l -U`. |
 | `src/upgrade.ts` | Self-update against the GitHub releases API. Network, token, binary path and the "run the new binary" step are all injected. |
 | `src/version.ts` | `VERSION` imported from `package.json`, which is the single source of truth. |
+| `src/subreddits.ts` | The subreddit allowlist, `~/.config/focus/subreddits.json` (`{ "version": 1, "allow": [...] }`). `normalizeSubreddit` accepts names, `r/name` and Reddit URLs, and rejects feeds (`all`, `popular`, …) and multireddits. At most 500 names. |
+| `src/chrome.ts` | Installing the extension: `writeExtension` copies `EXTENSION_FILES` into a staging folder, stamps `version`/`version_name`, then swaps it into place. `writeNativeHostManifest` registers the binary with Chrome for the extension's id, which `extensionId` derives from the manifest `key`. |
+| `src/nativehost.ts` | focus as the extension's native-messaging host: little-endian length-prefixed JSON on stdin/stdout, one request and one reply. `respond` reads the system hosts file's state and the allowlist, and refreshes an installed extension whose `version_name` differs. |
+| `extension/` | The Chrome MV3 extension, plain JavaScript checked by `extension/tsconfig.json`. `rules.js` is pure (bun tests import it): `buildRules` turns the policy into declarativeNetRequest rules and `evaluate` predicts what Chrome does with them. `background.js` syncs with focus and enforces navigation; `comments.js` reports a bare `/comments/<id>` page's subreddit; `blocked.html`/`blocked.js` explain a block. The build embeds the folder with `--asset ./extension`. |
 | `scripts/build-release.ts` | Compiles, signs, smoke-tests `--version`, and writes `SHA256SUMS`. |
 | `docs/images/` | README screenshots, light and dark, exported at 2x from the Paper file "Patient umbrella", page "README — focus images". They're designed mockups of real output, so re-export them when the `init` checklist, `status` or diff output changes. |
 | `install.sh` | The POSIX sh installer. It uses `gh release download` when `gh` is authenticated, otherwise public URLs. |
@@ -81,6 +86,14 @@ Use Bun, not Node: run with `bun`, test with `bun:test`, use `Bun.file`/`Bun.wri
   - `setup-sudo` refuses to run from source and refuses an unsafe binary.
 
   Keep all three when adding commands or flags. A new flag that names a path or URL is a privilege-escalation risk.
+- **Allowed subreddits are a separate component.** Hosts-file code doesn't know about them.
+  - **On/off comes from the hosts file.** The native host only reads the section's `state`; there's no second switch. A missing section means `none`, which doesn't enforce.
+  - **The allowlist is the extension's own state.** It's at a fixed user path with no environment override, because Chrome starts the host without the shell's environment. It's never in `config.json` or the hosts file, and root never reads it: `reddit` and the native host refuse root, and `status` skips the list as root.
+  - **The native host is one-shot and read-only.** Chrome starts it per message; it reads `systemHostsFile` (never `--hosts-file` or `FOCUS_HOSTS_FILE`) and the allowlist, and nothing else may be written to stdout. Its only write is refreshing the installed extension folder after an upgrade. Don't turn it into a long-running process.
+  - **Rules block pages only** (`main_frame`, `sub_frame`) with the `block` action, never scripts, media or API calls, so Reddit's own changes don't break allowed subreddits. All rules are dynamic, so off is an empty rule set. One allow rule per subreddit keeps each regex small; Chrome allows 1,000 regex rules.
+  - **The extension installs rules before updating its cached policy,** so the cache is never ahead of what Chrome enforces. Navigation checks decide from the cache synchronously.
+  - **focus never removes the `reddit` preset itself.** The user does it once the extension works; `reddit allow` and `status` warn while the preset makes the list ineffective.
+  - **The extension id is pinned** by the `key` in `extension/manifest.json` (`ppkaiojneebcgfinkmccagdflccineob`). The private key was never kept; it's only needed to pack a CRX. Changing the key changes the id and breaks every installed host manifest.
 - **DNS is flushed only after writing the real `/etc/hosts`.** The check compares against `realpath("/etc/hosts")`. Any other path never triggers `dscacheutil` or `killall`.
 - **Writes are atomic and keep mode, uid and gid.** Extended attributes and ACLs are not kept. That trade-off is documented in the guide.
 
@@ -98,6 +111,7 @@ Use Bun, not Node: run with `bun`, test with `bun:test`, use `Bun.file`/`Bun.wri
   - Asset downloads use `redirect: "manual"` and follow the storage redirect without the `Authorization` header, because the storage service rejects requests that carry it.
   - The repo is public, so the README's `curl | sh` one-liner and unauthenticated release downloads work. `install.sh` still prefers `gh` when it's logged in.
 - **Interactive testing:** `init` needs a TTY. To drive it in a pseudo-terminal, use `script -q log sh -c 'stty cols 100 rows 40; bun src/cli.ts init'` and pipe keystrokes in with `sleep`s between them. Without `stty`, the terminal has zero columns and clack wraps every character onto its own line.
+- **Testing the extension in Chrome:** `bun test` covers the rules, the native host and the CLI, not Chrome itself. Branded Chrome ignores `--load-extension`, so use Chrome for Testing (`bunx @puppeteer/browsers install chrome@stable`) with a temporary `--user-data-dir`, `--load-extension`, and `--host-resolver-rules` mapping the Reddit hosts to a local `Bun.serve`. Serve it over HTTPS with a self-signed certificate and `--ignore-certificate-errors`, because reddit.com is HSTS-preloaded. Chrome looks for native-messaging host manifests in `<user-data-dir>/NativeMessagingHosts`, so the real Chrome setup is never touched. The host there should call `respond` with a temp hosts file, because the binary's host always reads `/etc/hosts`.
 - **CI:** runs on `macos-latest`. That's free for public repos; if the repo goes private again, macOS minutes count 10 times faster than Linux.
 
 ## Releasing
@@ -109,7 +123,3 @@ Bump `version` in `package.json`, commit, then `git tag vX.Y.Z && git push origi
 4. publishes `focus-darwin-arm64`, `SHA256SUMS` and `install.sh` with `gh release create`.
 
 The asset names are used in three places: `src/upgrade.ts` (`ASSET` and `CHECKSUMS`), `install.sh`, and the workflow. Change them in all three together.
-
-## Follow-ups
-
-- **Allow chosen subreddits and block the rest of Reddit.** This can't be done in `/etc/hosts`, which only sees hostnames, and subreddits are paths. It needs a browser extension (preferred) or a proxy that intercepts TLS. See the guide's "Follow-ups" section. Build it as a separate component, not a hosts-file feature.

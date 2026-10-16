@@ -1,7 +1,16 @@
 #!/usr/bin/env bun
 import { access, constants, realpath } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
+import {
+  type ChromeDeps,
+  defaultChromePaths,
+  isDirectory,
+  readExtensionId,
+  removeChromeFiles,
+  writeExtension,
+  writeNativeHostManifest,
+} from "./chrome.ts";
 import { ConfigError, type LoadedConfig, loadConfig, resolveConfigPath } from "./config.ts";
 import { unifiedDiff } from "./diff.ts";
 import { InvalidHostnameError, normalizeHostname } from "./hostname.ts";
@@ -21,8 +30,17 @@ import {
   removeSudoersRule,
   sudoersRule,
 } from "./sudo.ts";
+import { NativeMessageError, blocksReddit, encodeMessage, readMessage, respond } from "./nativehost.ts";
 import { PRESETS, type Preset, findPreset, presetBlocking, syncSection, withPresets } from "./presets.ts";
 import { promptForPresets } from "./prompt.ts";
+import {
+  MAX_SUBREDDITS,
+  SubredditError,
+  defaultAllowlistPath,
+  normalizeSubreddit,
+  readAllowlist,
+  writeAllowlist,
+} from "./subreddits.ts";
 import { UpgradeError, type UpgradeResult, upgrade } from "./upgrade.ts";
 import { VERSION } from "./version.ts";
 
@@ -42,6 +60,11 @@ Commands:
   off                     Turn blocking off but keep the list
   status                  Show whether blocking is on and what's listed
   sync                    Update presets to this version's hostnames
+  reddit allow <name...>  Let these subreddits load in Chrome while the rest of Reddit is blocked
+  reddit disallow <name...>
+                          Take subreddits off that list
+  reddit list             Show the allowed subreddits
+  reddit install          Set up the Chrome extension that enforces the list (uninstall removes it)
   upgrade                 Install the latest release, then sync (--dry-run only checks)
   setup-sudo              Let focus get root without a password (--remove undoes it)
   version                 Print the version
@@ -85,11 +108,20 @@ export interface Io {
   /** Path of the installed compiled binary, or null when running from source. */
   binaryPath: string | null;
   sudoers: SudoersDeps;
+  /** Paths for the subreddit allowlist and the Chrome extension. */
+  chrome: ChromeDeps;
+  /** Chrome's pipe when it runs focus as the extension's native-messaging host. */
+  nativeMessaging: {
+    input(): AsyncIterable<Uint8Array>;
+    output(bytes: Uint8Array): Promise<void>;
+  };
 }
 
 class UsageError extends Error {}
 
 export async function run(argv: string[], io: Io): Promise<number> {
+  // Chrome runs the native-messaging host with the calling extension's origin as its only argument.
+  if (argv[0]?.startsWith("chrome-extension://")) return runNativeHost(io);
   try {
     return await runCommand(argv, io);
   } catch (error) {
@@ -175,6 +207,7 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
   if (io.isRoot && !targetsSystemHosts) {
     throw new UsageError(`as root, focus only manages ${io.systemHostsFile}; --hosts-file and FOCUS_HOSTS_FILE can't point elsewhere`);
   }
+  if (command === "reddit") return reddit(args, hostsPath, values["dry-run"] ?? false, io);
   // A bare `focus` with nothing to toggle shows help instead of asking sudo for nothing.
   if (command === undefined && !readSection((await readHostsFile(hostsPath)).content)) {
     io.stdout(USAGE + "\n");
@@ -200,6 +233,8 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
     if (current && writeSection(snapshot.content, current) !== snapshot.content) {
       io.stdout("Sync:       needed, the presets changed in this version; run `focus sync`\n");
     }
+    // Root never reads the allowlist; it's the user's file and only the extension uses it.
+    if (!io.isRoot) io.stdout(await formatSubreddits(io.chrome.allowlistPath, current));
     io.stdout(formatConfig(loaded));
     return 0;
   }
@@ -291,6 +326,167 @@ async function setupSudo(argv: string[], options: { remove: boolean; dryRun: boo
   await installSudoersRule(user, binary, io.sudoers);
   io.stdout(`Installed ${io.sudoers.path}. ${user} can now run focus without sudo or a password.\n`);
   return 0;
+}
+
+async function reddit(args: string[], hostsPath: string, dryRun: boolean, io: Io): Promise<number> {
+  if (io.isRoot) {
+    throw new UsageError("run `focus reddit` as yourself, not with sudo; it never needs root");
+  }
+  if (dryRun) throw new UsageError("--dry-run doesn't apply to focus reddit");
+  const [subcommand, ...names] = args;
+  const path = io.chrome.allowlistPath;
+
+  switch (subcommand) {
+    case "allow": {
+      const requested = parseSubreddits(names, "reddit allow");
+      const { allow } = await readAllowlist(path);
+      for (const name of requested) if (allow.includes(name)) io.stderr(`focus: r/${name} is already allowed\n`);
+      const added = requested.filter((name) => !allow.includes(name));
+      if (allow.length + added.length > MAX_SUBREDDITS) {
+        throw new UsageError(`focus allows at most ${MAX_SUBREDDITS} subreddits`);
+      }
+      if (added.length > 0) {
+        await writeAllowlist(path, [...allow, ...added]);
+        io.stdout(`Allowed in Chrome: ${added.map((name) => `r/${name}`).join(", ")}\n`);
+      }
+      await warnAboutRedditSetup(hostsPath, io);
+      return 0;
+    }
+    case "disallow": {
+      const requested = parseSubreddits(names, "reddit disallow");
+      const { allow } = await readAllowlist(path);
+      for (const name of requested) if (!allow.includes(name)) io.stderr(`focus: r/${name} isn't allowed\n`);
+      const removed = requested.filter((name) => allow.includes(name));
+      if (removed.length > 0) {
+        await writeAllowlist(path, allow.filter((name) => !removed.includes(name)));
+        io.stdout(`No longer allowed: ${removed.map((name) => `r/${name}`).join(", ")}\n`);
+      }
+      return 0;
+    }
+    case "list": {
+      if (names.length > 0) throw new UsageError("reddit list takes no arguments");
+      const { allow } = await readAllowlist(path);
+      io.stdout(
+        allow.length > 0
+          ? allow.map((name) => `r/${name}\n`).join("")
+          : "No subreddits are allowed. Add one with `focus reddit allow <name>`.\n",
+      );
+      return 0;
+    }
+    case "install": {
+      if (names.length > 0) throw new UsageError("reddit install takes no arguments");
+      if (!io.binaryPath) {
+        throw new Error("reddit install only works with the installed focus binary, not when running from source");
+      }
+      const binary = await realpath(io.binaryPath);
+      const { extensionDir, extensionSource, nativeHostsDir } = io.chrome;
+      await writeExtension(extensionSource, extensionDir, VERSION);
+      const manifest = await writeNativeHostManifest(nativeHostsDir, binary, await readExtensionId(extensionSource));
+      io.stdout(
+        `Wrote the Chrome extension to ${extensionDir}\n` +
+          `Registered focus with Chrome in ${manifest}\n\n` +
+          "To finish in Chrome (once):\n" +
+          "  1. Open chrome://extensions and turn on Developer mode.\n" +
+          `  2. Click "Load unpacked" and choose the folder above. It's open in Finder; in the\n` +
+          "     file picker, press Cmd-Shift-G and paste the path.\n" +
+          `  3. Click Details on "focus: allowed subreddits" and turn on "Allow in Incognito".\n\n` +
+          "Then:\n" +
+          "  focus reddit allow <name>       for each subreddit you want\n" +
+          "  focus remove --preset reddit    the hosts file would otherwise block all of Reddit\n" +
+          "Check that an allowed subreddit loads and another shows focus's blocked page. If it\n" +
+          "doesn't, `focus add --preset reddit` blocks all of Reddit again.\n",
+      );
+      await io.chrome.openFolder(extensionDir).catch(() => {});
+      return 0;
+    }
+    case "uninstall": {
+      if (names.length > 0) throw new UsageError("reddit uninstall takes no arguments");
+      const removed = await removeChromeFiles(io.chrome);
+      io.stdout(
+        (removed.length > 0 ? removed.map((file) => `Removed ${file}\n`).join("") : "Nothing to remove.\n") +
+          `Remove "focus: allowed subreddits" at chrome://extensions too. Your allowlist stays in ${path}.\n` +
+          "To block all of Reddit again: focus add --preset reddit\n",
+      );
+      return 0;
+    }
+    default:
+      throw new UsageError(
+        subcommand
+          ? `unknown reddit command '${subcommand}'`
+          : "focus reddit needs a command: allow, disallow, list, install or uninstall",
+      );
+  }
+}
+
+function parseSubreddits(args: string[], command: string): string[] {
+  if (args.length === 0) throw new UsageError(`${command} needs at least one subreddit`);
+  const errors: string[] = [];
+  const names: string[] = [];
+  for (const arg of args) {
+    try {
+      const name = normalizeSubreddit(arg);
+      if (!names.includes(name)) names.push(name);
+    } catch (error) {
+      if (!(error instanceof SubredditError)) throw error;
+      errors.push(error.message);
+    }
+  }
+  if (errors.length > 0) throw new UsageError(errors.join("\n"));
+  return names;
+}
+
+/** Points out the two setups in which the allowlist does nothing. */
+async function warnAboutRedditSetup(hostsPath: string, io: Io): Promise<void> {
+  const section = readSection((await readHostsFile(hostsPath)).content);
+  if (!section || isEmpty(section)) {
+    io.stderr("focus: nothing is blocked in the hosts file, so `focus on` has nothing to turn on and Chrome won't restrict Reddit\n");
+  } else if (blocksReddit(section)) {
+    io.stderr(
+      "focus: the hosts file still blocks all of Reddit while focus is on. Once the Chrome extension works,\n" +
+        "run `focus remove --preset reddit` so the allowed subreddits can load.\n",
+    );
+  }
+  if (!(await isDirectory(io.chrome.extensionDir))) {
+    io.stderr("focus: the Chrome extension isn't set up yet; run `focus reddit install`\n");
+  }
+}
+
+async function formatSubreddits(path: string, section: FocusSection | null): Promise<string> {
+  let allow: string[];
+  try {
+    const list = await readAllowlist(path);
+    if (!list.found) return "";
+    allow = list.allow;
+  } catch (error) {
+    return `Subreddits: ${describeError(error)}\n`;
+  }
+  const names = allow.length > 0 ? allow.map((name) => `r/${name}`).join(", ") : "none";
+  const note = section && blocksReddit(section) ? "\n            (no effect: the hosts file blocks all of Reddit)" : "";
+  return `Subreddits: ${names} (allowed in Chrome)${note}\n`;
+}
+
+async function runNativeHost(io: Io): Promise<number> {
+  if (io.isRoot) {
+    io.stderr("focus: the Chrome extension's host doesn't run as root\n");
+    return 1;
+  }
+  try {
+    const request = await readMessage(io.nativeMessaging.input());
+    const reply = await respond(request, {
+      systemHostsFile: io.systemHostsFile,
+      allowlistPath: io.chrome.allowlistPath,
+      extensionSource: io.chrome.extensionSource,
+      extensionDir: io.chrome.extensionDir,
+      version: VERSION,
+      log: io.stderr,
+    });
+    // Chrome reads stdout as messages, so nothing else may ever be written there.
+    await io.nativeMessaging.output(encodeMessage(reply));
+    return 0;
+  } catch (error) {
+    io.stderr(`focus: ${describeError(error)}\n`);
+    return 1;
+  }
 }
 
 async function isSameFile(a: string, b: string): Promise<boolean> {
@@ -478,7 +674,9 @@ function describeError(error: unknown): string {
     error instanceof ConcurrentModificationError ||
     error instanceof ConfigError ||
     error instanceof UpgradeError ||
-    error instanceof SudoSetupError
+    error instanceof SudoSetupError ||
+    error instanceof SubredditError ||
+    error instanceof NativeMessageError
   ) {
     return error.message;
   }
@@ -563,6 +761,17 @@ if (import.meta.main) {
       trustedUid: 0,
       validate: validateSudoers,
       verify: sudoAllows,
+    },
+    chrome: {
+      allowlistPath: defaultAllowlistPath(),
+      // `--asset ./extension` puts the files beside the compiled code; from source they're in the repo.
+      extensionSource: Bun.main.startsWith("/$bunfs/") ? join(import.meta.dir, "extension") : join(import.meta.dir, "..", "extension"),
+      ...defaultChromePaths(),
+      openFolder: async (path) => void (await Bun.$`open ${path}`.quiet().nothrow()),
+    },
+    nativeMessaging: {
+      input: () => Bun.stdin.stream(),
+      output: async (bytes) => void (await Bun.write(Bun.stdout, bytes)),
     },
   });
   process.exit(code);

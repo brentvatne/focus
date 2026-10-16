@@ -3,7 +3,9 @@ import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, stat, symlink } fr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Io, run } from "../src/cli.ts";
+import { encodeMessage, readMessage } from "../src/nativehost.ts";
 import { UpgradeError } from "../src/upgrade.ts";
+import { VERSION } from "../src/version.ts";
 
 const ORIGINAL = `##
 # Host Database
@@ -12,6 +14,8 @@ const ORIGINAL = `##
 255.255.255.255\tbroadcasthost
 ::1             localhost
 `;
+
+const EXTENSION_SOURCE = join(import.meta.dir, "..", "extension");
 
 let dir: string;
 let hostsFile: string;
@@ -64,6 +68,24 @@ async function focusWith(overrides: Partial<Io>, ...argv: string[]) {
       },
       verify: async () => {
         throw new Error("tests must stub sudoers.verify");
+      },
+    },
+    // The allowlist and Chrome's folders live in the temp dir, never in the real ~/Library or ~/.config.
+    chrome: {
+      allowlistPath: join(dir, "subreddits.json"),
+      extensionSource: EXTENSION_SOURCE,
+      extensionDir: join(dir, "chrome-extension"),
+      nativeHostsDir: join(dir, "NativeMessagingHosts"),
+      openFolder: async () => {
+        throw new Error("tests must stub chrome.openFolder");
+      },
+    },
+    nativeMessaging: {
+      input: () => {
+        throw new Error("tests must stub nativeMessaging.input");
+      },
+      output: async () => {
+        throw new Error("tests must stub nativeMessaging.output");
       },
     },
     ...overrides,
@@ -779,6 +801,194 @@ describe("config file", () => {
   test("help works even when the config is broken", async () => {
     await Bun.write(configFile, "nope");
     expect((await focus("--help")).code).toBe(0);
+  });
+});
+
+describe("reddit", () => {
+  const allowlist = () => join(dir, "subreddits.json");
+
+  test("allow, list and disallow edit only the allowlist", async () => {
+    await focus("add", "x.com");
+    const hostsBefore = await read();
+
+    const allowed = await focus("reddit", "allow", "Rust", "r/de", "https://old.reddit.com/r/rust/");
+    expect(allowed.code).toBe(0);
+    expect(allowed.stdout).toBe("Allowed in Chrome: r/rust, r/de\n");
+    expect(await Bun.file(allowlist()).json()).toEqual({ version: 1, allow: ["rust", "de"] });
+
+    expect((await focus("reddit", "allow", "rust")).stderr).toContain("r/rust is already allowed");
+    expect((await focus("reddit", "list")).stdout).toBe("r/rust\nr/de\n");
+
+    const removed = await focus("reddit", "disallow", "rust", "pics");
+    expect(removed.stdout).toBe("No longer allowed: r/rust\n");
+    expect(removed.stderr).toContain("r/pics isn't allowed");
+    expect((await focus("reddit", "list")).stdout).toBe("r/de\n");
+
+    expect(await read()).toBe(hostsBefore);
+  });
+
+  test("list says when nothing is allowed", async () => {
+    expect((await focus("reddit", "list")).stdout).toContain("No subreddits are allowed");
+  });
+
+  test("rejects bad names without writing anything", async () => {
+    const result = await focus("reddit", "allow", "rust", "all", "a+b");
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("r/all isn't a subreddit");
+    expect(result.stderr).toContain("allow each one separately");
+    expect(await Bun.file(allowlist()).exists()).toBe(false);
+  });
+
+  test("allow warns when the hosts file makes the list ineffective", async () => {
+    const nothing = await focus("reddit", "allow", "rust");
+    expect(nothing.stderr).toContain("nothing is blocked in the hosts file");
+    expect(nothing.stderr).toContain("run `focus reddit install`");
+
+    await focus("init", "reddit", "x");
+    const dns = await focus("reddit", "allow", "de");
+    expect(dns.stderr).toContain("still blocks all of Reddit");
+    expect(dns.stderr).toContain("focus remove --preset reddit");
+  });
+
+  test.each([[["reddit"]], [["reddit", "frobnicate"]], [["reddit", "allow"]], [["reddit", "list", "x"]], [["reddit", "allow", "-n", "rust"]]])(
+    "rejects %p",
+    async (argv) => {
+      expect((await focus(...argv)).code).toBe(2);
+      expect(await Bun.file(allowlist()).exists()).toBe(false);
+    },
+  );
+
+  test("refuses to run as root", async () => {
+    const result = await focusWith({ isRoot: true, systemHostsFile: hostsFile }, "reddit", "allow", "rust");
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("never needs root");
+  });
+
+  test("never asks sudo, even for the system hosts file", async () => {
+    const result = await focusWith({ systemHostsFile: hostsFile, env: { FOCUS_CONFIG: configFile } }, "reddit", "allow", "rust");
+    expect(result.code).toBe(0);
+  });
+
+  test("install writes the extension and registers the binary with Chrome", async () => {
+    const binary = join(dir, "focus-bin");
+    await Bun.write(binary, "");
+    const opened: string[] = [];
+    const chrome = {
+      allowlistPath: allowlist(),
+      extensionSource: EXTENSION_SOURCE,
+      extensionDir: join(dir, "chrome-extension"),
+      nativeHostsDir: join(dir, "NativeMessagingHosts"),
+      openFolder: async (path: string) => void opened.push(path),
+    };
+    const result = await focusWith({ binaryPath: binary, chrome }, "reddit", "install");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("Load unpacked");
+    expect(opened).toEqual([chrome.extensionDir]);
+    expect(await Bun.file(join(chrome.extensionDir, "manifest.json")).json()).toMatchObject({ version_name: VERSION });
+    expect(await Bun.file(join(chrome.nativeHostsDir, "com.brentvatne.focus.json")).json()).toEqual({
+      name: "com.brentvatne.focus",
+      description: expect.any(String),
+      path: await realpath(binary),
+      type: "stdio",
+      allowed_origins: ["chrome-extension://ppkaiojneebcgfinkmccagdflccineob/"],
+    });
+
+    const uninstalled = await focusWith({ chrome }, "reddit", "uninstall");
+    expect(uninstalled.stdout).toContain(`Removed ${chrome.extensionDir}`);
+    expect(await readdir(dir)).not.toContain("chrome-extension");
+    expect(await readdir(chrome.nativeHostsDir)).toEqual([]);
+    expect((await focusWith({ chrome }, "reddit", "uninstall")).stdout).toContain("Nothing to remove");
+  });
+
+  test("install refuses to run from source", async () => {
+    const result = await focus("reddit", "install");
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("not when running from source");
+    expect(await readdir(dir)).not.toContain("NativeMessagingHosts");
+  });
+
+  test("status shows the list only once there is one", async () => {
+    await focus("add", "x.com");
+    expect((await focus("status")).stdout).not.toContain("Subreddits");
+    await focus("reddit", "allow", "rust");
+    expect((await focus("status")).stdout).toContain("Subreddits: r/rust (allowed in Chrome)\nConfig:");
+    await focus("add", "--preset", "reddit");
+    expect((await focus("status")).stdout).toContain("(no effect: the hosts file blocks all of Reddit)");
+  });
+
+  test("status as root doesn't read the allowlist", async () => {
+    await focus("add", "x.com");
+    await Bun.write(allowlist(), "not json");
+    expect((await focus("status")).stdout).toContain("Subreddits: ");
+    const asRoot = await focusWith({ isRoot: true, systemHostsFile: hostsFile, env: { FOCUS_CONFIG: configFile } }, "status");
+    expect(asRoot.code).toBe(0);
+    expect(asRoot.stdout).not.toContain("Subreddits");
+  });
+});
+
+describe("native messaging host", () => {
+  async function host(request: unknown, overrides: Partial<Io> = {}) {
+    let reply: Uint8Array | null = null;
+    const result = await focusWith(
+      {
+        // Chrome runs the host as the user, against the real system hosts file; here, the temp one.
+        systemHostsFile: hostsFile,
+        nativeMessaging: {
+          input: async function* () {
+            yield encodeMessage(request);
+          },
+          output: async (bytes) => void (reply = bytes),
+        },
+        elevate: async () => {
+          throw new Error("the native host must never elevate");
+        },
+        ...overrides,
+      },
+      "chrome-extension://ppkaiojneebcgfinkmccagdflccineob/",
+    );
+    return { ...result, reply: reply ? await readMessage((async function* () { yield reply!; })()) : null };
+  }
+
+  test("answers with the state and the allowlist, and changes nothing", async () => {
+    await focus("add", "x.com");
+    await focus("reddit", "allow", "rust");
+    const before = await read();
+    const result = await host({ type: "status" });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.reply).toMatchObject({ state: "on", allow: ["rust"], redditBlockedByHosts: false, reload: false });
+    expect(await read()).toBe(before);
+  });
+
+  test("ignores FOCUS_HOSTS_FILE; Chrome's environment can't redirect it", async () => {
+    await Bun.write(join(dir, "other"), "127.0.0.1 localhost\n");
+    await focus("add", "x.com");
+    const result = await host({ type: "status" }, { env: { FOCUS_HOSTS_FILE: join(dir, "other") } });
+    expect(result.reply).toMatchObject({ state: "on" });
+  });
+
+  test("refuses to run as root", async () => {
+    const result = await host({ type: "status" }, { isRoot: true });
+    expect(result.code).toBe(1);
+    expect(result.reply).toBeNull();
+  });
+
+  test("reports a garbled request on stderr only", async () => {
+    const result = await focusWith(
+      {
+        nativeMessaging: {
+          input: async function* () {
+            yield new Uint8Array([1, 0]);
+          },
+          output: async () => {
+            throw new Error("nothing should be written");
+          },
+        },
+      },
+      "chrome-extension://ppkaiojneebcgfinkmccagdflccineob/",
+    );
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("stdin closed");
   });
 });
 
