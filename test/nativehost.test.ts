@@ -3,7 +3,7 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROTOCOL } from "../extension/rules.js";
-import { chromeVersion, extensionId, readExtensionId, writeExtension } from "../src/chrome.ts";
+import { EXTENSION_FILES, chromeVersion, extensionId, readExtensionId, writeExtension } from "../src/chrome.ts";
 import { MAX_MESSAGE_BYTES, type StatusReply, encodeMessage, readMessage, respond } from "../src/nativehost.ts";
 
 const EXTENSION_SOURCE = join(import.meta.dir, "..", "extension");
@@ -46,6 +46,7 @@ describe("respond", () => {
   const deps = () => ({
     systemHostsFile: hosts,
     allowlistPath: allowlist,
+    feedsPath: join(dir, "feeds.json"),
     extensionSource: EXTENSION_SOURCE,
     extensionDir: join(dir, "chrome-extension"),
     version: "9.9.9",
@@ -77,10 +78,27 @@ describe("respond", () => {
       protocol: PROTOCOL,
       version: "9.9.9",
       state,
+      reddit: true,
       allow: ["rust"],
+      feeds: [],
       redditBlockedByHosts,
       reload: false,
     } as never);
+  });
+
+  test("reports the feeds, and limits Reddit only once there's an allowlist", async () => {
+    await Bun.write(hosts, section("on", "a.com"));
+    await Bun.write(join(dir, "feeds.json"), '{"version":1,"feeds":["x"]}');
+    await rm(allowlist);
+    expect(await respond({ type: "status" }, deps())).toMatchObject({ state: "on", reddit: false, allow: [], feeds: ["x"] });
+  });
+
+  test("a broken feeds file blocks every feed and says why", async () => {
+    await Bun.write(hosts, section("off", "a.com"));
+    await Bun.write(join(dir, "feeds.json"), "{ nope");
+    const reply = await respond({ type: "status" }, deps());
+    expect(reply).toMatchObject({ state: "off", feeds: ["youtube", "x"], feedsError: expect.stringMatching(/invalid JSON/) });
+    expect(reply).not.toHaveProperty("error");
   });
 
   test("reports a malformed section as an error, never as off", async () => {
@@ -132,6 +150,11 @@ describe("extension files", () => {
     expect(chromeVersion("1.2.3.4.5")).toBe("1.2.3.4");
   });
 
+  test("ships every file in extension/ but its tsconfig", async () => {
+    const files = (await readdir(EXTENSION_SOURCE)).filter((name) => name !== "tsconfig.json");
+    expect([...EXTENSION_FILES].sort()).toEqual(files.sort());
+  });
+
   test("writes only the shipped files, stamped, replacing an older copy", async () => {
     const dir = await mkdtemp(join(tmpdir(), "focus-ext-"));
     try {
@@ -139,9 +162,7 @@ describe("extension files", () => {
       await writeExtension(EXTENSION_SOURCE, target, "0.1.0");
       await Bun.write(join(target, "stale.js"), "old");
       await writeExtension(EXTENSION_SOURCE, target, "0.2.0-rc.1");
-      expect((await readdir(target)).sort()).toEqual(
-        ["background.js", "blocked.html", "blocked.js", "comments.js", "manifest.json", "rules.js"].sort(),
-      );
+      expect((await readdir(target)).sort()).toEqual([...EXTENSION_FILES].sort());
       const manifest = await Bun.file(join(target, "manifest.json")).json();
       expect(manifest).toMatchObject({ version: "0.2.0", version_name: "0.2.0-rc.1", manifest_version: 3 });
       expect(await readdir(dir)).toEqual(["chrome-extension"]); // no staging or old copies left behind

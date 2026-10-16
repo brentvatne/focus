@@ -2,14 +2,26 @@
 // Keeps Chrome's blocking rules in step with focus. Every decision is made from
 // the cached policy, synchronously; the cache is refreshed by asking the focus
 // binary (a one-shot native message, so nothing keeps running in between).
-import { PROTOCOL, UNKNOWN_POLICY, buildRules, isAllowed, isBarePost, mayStay, postIdOf } from "./rules.js";
+import {
+  BLOCKED_PAGES,
+  PROTOCOL,
+  SITE_HOSTS,
+  UNKNOWN_POLICY,
+  buildRules,
+  isAllowed,
+  isBarePost,
+  mayStay,
+  postIdOf,
+  siteOf,
+} from "./rules.js";
 
 const HOST = "com.brentvatne.focus";
-const REDDIT_TABS = ["*://*.reddit.com/*"];
-const REDDIT_EVENTS = { url: [{ hostSuffix: "reddit.com" }] };
-const REINSTALL = "If this persists, run `focus reddit install`.";
-// Where Incognito tabs go: extension pages can't open there, but Chrome's own blocked page can.
-const BLOCKED_IN_INCOGNITO = "https://www.reddit.com/";
+const HOSTS = Object.values(SITE_HOSTS).flat();
+// "*.host" also matches the host itself.
+const SITE_TABS = HOSTS.map((host) => `*://*.${host}/*`);
+// hostSuffix "x.com" would also match "box.com", so each host is matched exactly or as a subdomain.
+const SITE_EVENTS = { url: HOSTS.flatMap((host) => [{ hostEquals: host }, { hostSuffix: `.${host}` }]) };
+const REINSTALL = "If this persists, run `focus chrome install`.";
 
 /** @typedef {import("./rules.js").Policy} Policy */
 
@@ -38,8 +50,9 @@ async function reports() {
 
 async function cachedPolicy() {
   if (!policy) {
-    const stored = await chrome.storage.local.get("policy");
-    policy = /** @type {Policy | undefined} */ (stored.policy) ?? null;
+    const stored = /** @type {Partial<Policy> | undefined} */ ((await chrome.storage.local.get("policy")).policy);
+    // Cached by a version from before feeds, which always limited Reddit.
+    policy = stored ? /** @type {Policy} */ ({ reddit: true, feeds: [], ...stored }) : null;
   }
   return policy ?? UNKNOWN_POLICY;
 }
@@ -115,14 +128,24 @@ async function refreshOnce() {
     return;
   }
   /** @type {Policy} */
-  const next = { state: reply.state, allow: reply.allow };
+  const next = {
+    state: reply.state,
+    // A focus from before feeds always limited Reddit and had no feeds.
+    reddit: reply.reddit ?? true,
+    allow: reply.allow,
+    feeds: reply.feeds ?? [],
+  };
   const changed = JSON.stringify(await cachedPolicy()) !== JSON.stringify(next);
   // Rules first, then the cache: the cache is never ahead of what Chrome enforces, so
   // sending a tab away can't be undone by rules that still let it load.
   if (changed) await installRules(next);
   policy = next;
   // A broken allowlist arrives as an empty one: everything blocked while on, and off still off.
-  const hostError = reply.allowlistError ? `focus couldn't read the allowed subreddits: ${reply.allowlistError}` : null;
+  const hostError = reply.allowlistError
+    ? `focus couldn't read the allowed subreddits: ${reply.allowlistError}`
+    : reply.feedsError
+      ? `focus couldn't read which feeds to block, so it blocks them all: ${reply.feedsError}`
+      : null;
   await chrome.storage.local.set({ policy: next, hostError, checkedAt: Date.now() });
   if (changed) await sweepTabs();
 }
@@ -132,13 +155,15 @@ function isPolicyReply(reply) {
   return (
     ["on", "off", "none"].includes(/** @type {string} */ (reply.state)) &&
     Array.isArray(reply.allow) &&
-    reply.allow.every((name) => typeof name === "string")
+    reply.allow.every((name) => typeof name === "string") &&
+    (reply.reddit === undefined || typeof reply.reddit === "boolean") &&
+    (reply.feeds === undefined || (Array.isArray(reply.feeds) && reply.feeds.every((id) => typeof id === "string")))
   );
 }
 
-/** Sends every open Reddit tab that's no longer allowed away. */
+/** Sends every open tab that's no longer allowed away. */
 async function sweepTabs() {
-  for (const tab of await chrome.tabs.query({ url: REDDIT_TABS })) {
+  for (const tab of await chrome.tabs.query({ url: SITE_TABS })) {
     if (tab.id !== undefined && tab.url) await checkTab(tab.id, tab.url, { reloadUnreported: true });
   }
 }
@@ -167,10 +192,10 @@ async function checkTab(tabId, url, { reloadUnreported }) {
 }
 
 /**
- * Leaves a page Reddit shouldn't show. In a regular window that's focus's blocked page.
- * In Incognito, where a spanning extension can't open its own pages, it's a Reddit URL the
+ * Leaves a page focus blocks. In a regular window that's focus's blocked page. In Incognito,
+ * where a spanning extension can't open its own pages, it's a URL of the same site that the
  * rules block, so Chrome shows its own blocked page: the page itself if the rules block it,
- * otherwise (a post judged by its reported subreddit) Reddit's home page.
+ * otherwise (a Reddit post judged by its reported subreddit) the site's blocked home page.
  *
  * @param {number} tabId
  * @param {string} url
@@ -178,14 +203,26 @@ async function checkTab(tabId, url, { reloadUnreported }) {
  */
 async function enforce(tabId, url, subreddit = null) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
-  if (!tab) return;
+  // Decisions can take a moment (a refresh from focus first); by then the tab may have moved on.
+  if (!tab || !stillOn(tab, url)) return;
   const query = subreddit ? `?subreddit=${encodeURIComponent(subreddit)}` : "";
+  const site = siteOf(url);
   const target = tab.incognito
-    ? isAllowed(await cachedPolicy(), url)
-      ? BLOCKED_IN_INCOGNITO
+    ? isAllowed(await cachedPolicy(), url) && site
+      ? BLOCKED_PAGES[site]
       : url
     : chrome.runtime.getURL(`blocked.html${query}#${encodeURIComponent(url)}`);
   await chrome.tabs.update(tabId, { url: target }).catch(() => {});
+}
+
+/**
+ * Whether the tab is still on `url`: showing it with nothing else loading, or loading it.
+ * A tab that has started loading another page has moved on, even before it commits.
+ * @param {chrome.tabs.Tab} tab
+ * @param {string} url
+ */
+function stillOn(tab, url) {
+  return (tab.pendingUrl ?? tab.url) === url;
 }
 
 /**
@@ -215,24 +252,24 @@ chrome.runtime.onInstalled.addListener(() => void start());
 chrome.runtime.onStartup.addListener(() => void start());
 
 chrome.alarms.onAlarm.addListener(async () => {
-  // Only spend a process on it while Reddit is actually open.
-  if ((await chrome.tabs.query({ url: REDDIT_TABS })).length > 0) await refresh();
+  // Only spend a process on it while one of the sites is actually open.
+  if ((await chrome.tabs.query({ url: SITE_TABS })).length > 0) await refresh();
 });
 
 // The rules for this navigation are already decided; this refreshes them for the next one.
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId === 0) void refresh();
-}, REDDIT_EVENTS);
+}, SITE_EVENTS);
 
 // Client-side route changes and pages served by Reddit's service worker never reach the rules.
 // A route change keeps the old document, so a post there can't report itself without a reload.
 // A committed page loads comments.js, which reports for itself.
 chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   if (details.frameId === 0) void checkTab(details.tabId, details.url, { reloadUnreported: true });
-}, REDDIT_EVENTS);
+}, SITE_EVENTS);
 chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId === 0) void checkTab(details.tabId, details.url, { reloadUnreported: false });
-}, REDDIT_EVENTS);
+}, SITE_EVENTS);
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   const all = await reports();
@@ -250,14 +287,15 @@ chrome.webNavigation.onErrorOccurred.addListener(async (details) => {
     // Blocked by rules that were out of date when the navigation started (focus was just
     // turned off, or the subreddit just allowed), so try once more. Another extension's
     // block is retried once and then left alone.
-    if (once(recentlyRetried, details.tabId, details.url)) {
+    const tab = await chrome.tabs.get(details.tabId).catch(() => null);
+    if (tab && stillOn(tab, details.url) && once(recentlyRetried, details.tabId, details.url)) {
       await chrome.tabs.update(details.tabId, { url: details.url }).catch(() => {});
     }
     return;
   }
   const tab = await chrome.tabs.get(details.tabId).catch(() => null);
   if (tab && !tab.incognito) await enforce(details.tabId, details.url);
-}, REDDIT_EVENTS);
+}, SITE_EVENTS);
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "recheck") {

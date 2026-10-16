@@ -81,6 +81,7 @@ async function focusWith(overrides: Partial<Io>, ...argv: string[]) {
     // The allowlist and Chrome's folders live in the temp dir, never in the real ~/Library or ~/.config.
     chrome: {
       allowlistPath: join(dir, "subreddits.json"),
+      feedsPath: join(dir, "feeds.json"),
       extensionSource: EXTENSION_SOURCE,
       extensionDir: join(dir, "chrome-extension"),
       nativeHostsDir: join(dir, "NativeMessagingHosts"),
@@ -955,7 +956,7 @@ describe("reddit", () => {
   });
 
   test("rejects options that don't apply instead of ignoring them", async () => {
-    for (const flag of ["--exact", "--no-flush", "--preset", "--yes"]) {
+    for (const flag of ["--exact", "--preset", "--yes"]) {
       const result = await focus("reddit", "allow", flag, "rust");
       expect(result.code).toBe(2);
       expect(result.stderr).toContain(`--${flag.replace(/^--(no-)?/, "")} doesn't apply to focus reddit`);
@@ -978,12 +979,12 @@ describe("reddit", () => {
   test("allow warns when the hosts file makes the list ineffective", async () => {
     const nothing = await focus("reddit", "allow", "rust");
     expect(nothing.stderr).toContain("nothing is blocked in the hosts file");
-    expect(nothing.stderr).toContain("run `focus reddit install`");
+    expect(nothing.stderr).toContain("run `focus chrome install`");
 
     await focus("init", "reddit", "x");
     const dns = await focus("reddit", "allow", "de");
-    expect(dns.stderr).toContain("still blocks all of Reddit");
-    expect(dns.stderr).toContain("focus remove reddit");
+    expect(dns.stdout).toContain("The hosts file still blocks all of Reddit while focus is on, so this has no effect yet.");
+    expect(dns.stdout).toContain("To stop that: focus remove reddit\n");
   });
 
   test.each([[["reddit"]], [["reddit", "frobnicate"]], [["reddit", "allow"]], [["reddit", "list", "x"]], [["reddit", "allow", "-n", "rust"]]])(
@@ -1012,6 +1013,7 @@ describe("reddit", () => {
     const copied: string[] = [];
     const chrome = {
       allowlistPath: allowlist(),
+      feedsPath: join(dir, "feeds.json"),
       extensionSource: EXTENSION_SOURCE,
       extensionDir: join(dir, "chrome-extension"),
       nativeHostsDir: join(dir, "NativeMessagingHosts"),
@@ -1165,7 +1167,7 @@ describe("reddit", () => {
     const env = { FOCUS_HOSTS_FILE: hostsFile, FOCUS_CONFIG: configFile, TERM_PROGRAM: "iTerm.app" };
     const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome, env, ...terminal(["skip"]) }, "reddit", "install");
     expect(result.stdout).toContain(`\x1b]8;;file://${fake.chrome.extensionDir}\x1b\\${fake.chrome.extensionDir}\x1b]8;;\x1b\\`);
-    expect(result.stdout).toContain("\x1b]8;;https://github.com/brentvatne/focus/blob/main/docs/guide.md#allowing-subreddits-chrome\x1b\\the guide");
+    expect(result.stdout).toContain("\x1b]8;;https://github.com/brentvatne/focus/blob/main/docs/guide.md#finer-blocking-in-chrome\x1b\\the guide");
   });
 
   test("status and allow report whether Chrome has loaded the extension", async () => {
@@ -1175,7 +1177,7 @@ describe("reddit", () => {
     const notLoaded = await focusWith({ chrome: fake.chrome }, "reddit", "allow", "rust");
     expect(notLoaded.stderr).toContain("Chrome hasn't loaded the extension yet");
     expect((await focusWith({ chrome: fake.chrome }, "status")).stdout).toContain(
-      "Extension:  not loaded in Chrome; run `focus reddit install` to finish\n",
+      "Extension:  not loaded in Chrome; run `focus chrome install` to finish\n",
     );
     await fake.saveProfile(false);
     expect((await focusWith({ chrome: fake.chrome }, "status")).stdout).toContain(
@@ -1200,7 +1202,7 @@ describe("reddit", () => {
     const plain = await focusWith({ chrome: fake.chrome }, "reddit", "uninstall");
     expect(plain.stdout).toContain(`Removed ${fake.chrome.extensionDir}`);
     expect(plain.stdout).toContain(
-      `Chrome still lists "focus: allowed subreddits" (profile Person 1); click Remove on its details page, chrome://extensions/?id=${ID}.`,
+      `Chrome still lists the focus extension (profile Person 1); click Remove on its details page, chrome://extensions/?id=${ID}.`,
     );
     expect(fake.opened).toEqual([]);
     expect(await readdir(dir)).not.toContain("chrome-extension");
@@ -1212,6 +1214,106 @@ describe("reddit", () => {
     expect(asked.stdout).toContain("Press Enter to open it (Esc skips) \n");
     expect(fake.opened).toEqual([`chrome://extensions/?id=${ID}`]);
     expect((await focusWith({ chrome: fake.chrome }, "reddit", "uninstall")).stdout).toContain("Nothing to remove");
+  });
+
+  const feedsFile = () => join(dir, "feeds.json");
+
+  test("feeds add, list and remove edit only the feeds file", async () => {
+    const before = await read();
+    const added = await focus("feeds", "add", "YouTube", "x");
+    expect(added.code).toBe(0);
+    expect(added.stdout).toContain("✓ YouTube: in Chrome, focus blocks the home page, Shorts and Explore, and recommendations on video pages\n");
+    expect(added.stdout).toContain("✓ X: in Chrome, focus blocks the Home timeline, Explore, search and notifications\n");
+    expect(await Bun.file(feedsFile()).json()).toEqual({ version: 1, feeds: ["youtube", "x"] });
+    expect((await focus("feeds", "add", "x")).stderr).toContain("X's feed is already blocked");
+    expect((await focus("feeds", "list")).stdout).toBe(
+      "youtube: the home page, Shorts and Explore, and recommendations on video pages\nx: the Home timeline, Explore, search and notifications\n",
+    );
+    const removed = await focus("feeds", "remove", "youtube");
+    expect(removed.stdout).toBe("No longer blocking the feed of YouTube\nTo block all of it again: focus add youtube\n");
+    expect((await focus("feeds", "remove", "youtube")).stderr).toContain("YouTube's feed isn't blocked");
+    expect(await Bun.file(feedsFile()).json()).toEqual({ version: 1, feeds: ["x"] });
+    expect(await read()).toBe(before);
+  });
+
+  test("feeds list says when nothing is blocked", async () => {
+    expect((await focus("feeds", "list")).stdout).toBe("No feeds are blocked. Add one with `focus feeds add youtube x`.\n");
+  });
+
+  test.each([
+    ["twitter", "did you mean 'x'?"],
+    ["youtub", "did you mean 'youtube'?"],
+    ["facebook", "it can for youtube, x"],
+  ])("feeds add %s is refused with a suggestion", async (name, message) => {
+    const result = await focus("feeds", "add", name);
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain(`'${name}' isn't a site whose feed focus can block; ${message}`);
+    expect(await Bun.file(feedsFile()).exists()).toBe(false);
+  });
+
+  test.each([[["feeds"]], [["feeds", "add"]], [["feeds", "frobnicate"]], [["feeds", "list", "x"]], [["feeds", "add", "-n", "x"]], [["chrome"]], [["chrome", "install", "x"]]])(
+    "rejects %p",
+    async (argv) => {
+      expect((await focus(...argv)).code).toBe(2);
+      expect(await Bun.file(feedsFile()).exists()).toBe(false);
+    },
+  );
+
+  test("feeds refuses root", async () => {
+    const result = await focusWith({ isRoot: true, systemHostsFile: hostsFile }, "feeds", "add", "x");
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("run `focus feeds` as yourself");
+  });
+
+  test("feeds add says when the hosts file blocks the whole site, and how to stop that", async () => {
+    await focus("init", "youtube", "x");
+    const result = await focus("feeds", "add", "youtube");
+    expect(result.stdout).toContain("The hosts file still blocks all of YouTube while focus is on, so this has no effect yet.\nTo stop that: focus remove youtube\n");
+    expect((await focus("status")).stdout).toContain(
+      "Feeds:      YouTube (only the feed is blocked, in Chrome)\n            (no effect for YouTube: the hosts file blocks the whole site)\n",
+    );
+  });
+
+  test("in a terminal, Enter turns off the preset that blocks the whole site", async () => {
+    const fake = fakeChrome();
+    await focus("init", "youtube", "x");
+    const result = await focusWith({ chrome: fake.chrome, ...terminal(["enter"]) }, "feeds", "add", "youtube", "x");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("Press Enter to stop that (runs `focus remove x youtube`) (Esc skips) \n");
+    expect(await read()).toBe(ORIGINAL);
+    expect((await focusWith({ chrome: fake.chrome }, "status")).stdout).toContain("Feeds:      YouTube, X (only the feed is blocked, in Chrome)\n");
+  });
+
+  test("Esc keeps the preset", async () => {
+    await focus("init", "youtube");
+    const before = await read();
+    const result = await focusWith({ ...terminal(["skip"]) }, "feeds", "add", "youtube");
+    expect(result.code).toBe(0);
+    expect(await read()).toBe(before);
+  });
+
+  test("reddit allow offers to turn off the reddit preset too", async () => {
+    await focus("init", "reddit", "x");
+    const result = await focusWith({ ...terminal(["enter"]) }, "reddit", "allow", "rust");
+    expect(result.stdout).toContain("runs `focus remove reddit`");
+    expect((await focus("status")).stdout).toContain("Presets:    X / Twitter\n");
+  });
+
+  test("chrome install suggests feeds and subreddits when neither is set up", async () => {
+    const fake = fakeChrome();
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "chrome", "install");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("focus feeds add youtube x     block just their feeds\n");
+    expect(result.stdout).toContain("focus reddit allow <name...>  limit Reddit to chosen subreddits\n");
+  });
+
+  test("chrome install points out presets that undo what Chrome is set to do", async () => {
+    const fake = fakeChrome();
+    await focus("init", "youtube", "reddit", "x");
+    await focus("feeds", "add", "youtube");
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "chrome", "install");
+    expect(result.stdout).toContain("focus remove youtube  stop the hosts file from blocking all of YouTube\n");
+    expect(result.stdout).not.toContain("focus reddit allow");
   });
 
   test("install refuses to run from source", async () => {

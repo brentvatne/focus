@@ -1,19 +1,53 @@
 {
   "manifest_version": 3,
-  "name": "focus: allowed subreddits",
-  "description": "Blocks Reddit except the subreddits you allow with the focus CLI, while focus is on.",
+  "name": "focus",
+  "description": "While focus is on, blocks the feeds of YouTube and X and limits Reddit to the subreddits you allow, as set with the focus CLI.",
   "version": "0.0.0",
   "minimum_chrome_version": "121",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAo5gHxDlTYZ7PXH+lYd6/xYM8iah9qgQH43I1oh3BQe/zrKdtI6FxQ7J0UqcvKZ/mcF+yyl/0R67jQDYmUdu7i5OApqGLLqJnb6hLstwJUoPXw4KGUhOcKXa/nnGprknFFIGZpyw7XjTzWWzQzovswznW0LhUeXQpN/bu3hTz+wHSzFoBsU5PYfaz9jWAESXPdDX1VC+uZjrzQDqtUo6p1X5dy+UQflTMP8SBbOv52ibaSnNvyMHOrMIi7sEQ7bpaPoA/0RoGaDuDAYl/M3M71+XufEjo7flexC7QcyWfWt+LOgSXi9rO3q8j+d6ozq5Oldt0For7kuiY4G9dZmk1VQIDAQAB",
   "incognito": "spanning",
-  "background": { "service_worker": "background.js", "type": "module" },
-  "permissions": ["alarms", "declarativeNetRequest", "nativeMessaging", "storage", "tabs", "webNavigation"],
-  "host_permissions": ["*://*.reddit.com/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "alarms",
+    "declarativeNetRequest",
+    "nativeMessaging",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "*://*.reddit.com/*",
+    "*://*.youtube.com/*",
+    "*://*.youtu.be/*",
+    "*://*.x.com/*",
+    "*://*.twitter.com/*"
+  ],
   "content_scripts": [
     {
-      "matches": ["*://*.reddit.com/comments/*", "*://*.reddit.com/gallery/*", "*://*.reddit.com/r/*/comments/*"],
-      "js": ["comments.js"],
+      "matches": [
+        "*://*.reddit.com/comments/*",
+        "*://*.reddit.com/gallery/*",
+        "*://*.reddit.com/r/*/comments/*"
+      ],
+      "js": [
+        "comments.js"
+      ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://*.youtube.com/*"
+      ],
+      "css": [
+        "youtube.css"
+      ],
+      "js": [
+        "youtube.js"
+      ],
+      "run_at": "document_start"
     }
   ]
 }

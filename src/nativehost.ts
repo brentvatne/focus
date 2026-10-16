@@ -6,6 +6,7 @@ import { PROTOCOL } from "../extension/rules.js";
 import { isDirectory, writeExtension } from "./chrome.ts";
 import { type FocusSection, HostsFormatError, isEmpty, readSection } from "./hosts.ts";
 import { readHostsFile } from "./hostsfile.ts";
+import { FEED_SITES, readFeeds } from "./feeds.ts";
 import { readAllowlist } from "./subreddits.ts";
 
 /** Chrome's limit for a message from the host; requests are far smaller. */
@@ -52,6 +53,7 @@ export interface NativeHostDeps {
   /** Always the real system hosts file when Chrome runs focus; a temp file in tests. */
   systemHostsFile: string;
   allowlistPath: string;
+  feedsPath: string;
   extensionSource: string;
   extensionDir: string;
   version: string;
@@ -62,7 +64,11 @@ export interface StatusReply {
   protocol: number;
   version: string;
   state: "on" | "off" | "none" | "error";
+  /** Whether Reddit is limited to `allow`: true once `focus reddit allow` has written the list. */
+  reddit: boolean;
   allow: string[];
+  /** The sites whose feeds are blocked. */
+  feeds: string[];
   /** Reddit is in the hosts section, so DNS blocks it whatever the extension allows. */
   redditBlockedByHosts: boolean;
   /** focus rewrote the extension's folder for this version; the extension should reload. */
@@ -71,6 +77,8 @@ export interface StatusReply {
   error?: string;
   /** The allowlist couldn't be read, so `allow` is empty: nothing is allowed while on, and off still means off. */
   allowlistError?: string;
+  /** The feeds file couldn't be read, so every feed is blocked. */
+  feedsError?: string;
 }
 
 export async function respond(request: unknown, deps: NativeHostDeps): Promise<StatusReply | { error: string }> {
@@ -81,7 +89,9 @@ export async function respond(request: unknown, deps: NativeHostDeps): Promise<S
     protocol: PROTOCOL,
     version: deps.version,
     state: "none",
+    reddit: false,
     allow: [],
+    feeds: [],
     redditBlockedByHosts: false,
     reload: false,
   };
@@ -99,9 +109,18 @@ export async function respond(request: unknown, deps: NativeHostDeps): Promise<S
   }
   // Separate from the state, so a bad allowlist can't stop `focus off` from turning the extension off.
   try {
-    reply.allow = (await readAllowlist(deps.allowlistPath)).allow;
+    const list = await readAllowlist(deps.allowlistPath);
+    reply.reddit = list.found;
+    reply.allow = list.allow;
   } catch (error) {
+    reply.reddit = true;
     reply.allowlistError = messageOf(error);
+  }
+  try {
+    reply.feeds = await readFeeds(deps.feedsPath);
+  } catch (error) {
+    reply.feeds = FEED_SITES.map((site) => site.id);
+    reply.feedsError = messageOf(error);
   }
 
   // Only a folder focus wrote reports a version_name, so a development copy is never rewritten.

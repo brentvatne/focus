@@ -6,12 +6,23 @@ import { writeAtomically } from "./hostsfile.ts";
 /** The native-messaging host name the extension asks Chrome for. */
 export const NATIVE_HOST_NAME = "com.brentvatne.focus";
 
-/** What `focus reddit install` copies into the folder Chrome loads. Nothing else in extension/ ships. */
-export const EXTENSION_FILES = ["manifest.json", "background.js", "rules.js", "comments.js", "blocked.html", "blocked.js"];
+/** What `focus chrome install` copies into the folder Chrome loads. Nothing else in extension/ ships. */
+export const EXTENSION_FILES = [
+  "manifest.json",
+  "background.js",
+  "rules.js",
+  "comments.js",
+  "youtube.js",
+  "youtube.css",
+  "blocked.html",
+  "blocked.js",
+];
 
 export interface ChromeDeps {
   /** The subreddit allowlist (see subreddits.ts). */
   allowlistPath: string;
+  /** The sites whose feeds are blocked (see feeds.ts). */
+  feedsPath: string;
   /** Where the extension's files are read from: embedded in the binary, or extension/ from source. */
   extensionSource: string;
   /** The folder focus writes and Chrome loads with "Load unpacked". */
@@ -160,7 +171,7 @@ export async function writeNativeHostManifest(nativeHostsDir: string, binary: st
   return path;
 }
 
-/** Removes only what `focus reddit install` wrote. The allowlist stays. */
+/** Removes only what `focus chrome install` wrote. Your settings stay. */
 export async function removeChromeFiles(deps: Pick<ChromeDeps, "extensionDir" | "nativeHostsDir">): Promise<string[]> {
   const removed: string[] = [];
   const manifest = nativeHostManifestPath(deps.nativeHostsDir);

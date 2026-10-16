@@ -1,0 +1,11 @@
+/* Recommendations on YouTube, hidden while focus blocks its feed (youtube.js sets the attribute). */
+html[data-focus-hide-recommendations] #related,
+html[data-focus-hide-recommendations] ytd-watch-next-secondary-results-renderer,
+html[data-focus-hide-recommendations] .ytp-endscreen-content,
+html[data-focus-hide-recommendations] .ytp-ce-element,
+html[data-focus-hide-recommendations] .ytp-autonav-endscreen-countdown-overlay,
+html[data-focus-hide-recommendations] .ytp-fullscreen-grid,
+html[data-focus-hide-recommendations] .ytp-fullscreen-grid-peeking,
+html[data-focus-hide-recommendations] ytd-reel-shelf-renderer {
+  display: none !important;
+}
