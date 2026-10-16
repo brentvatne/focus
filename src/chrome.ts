@@ -1,4 +1,4 @@
-import { mkdir, rename, rm, stat } from "node:fs/promises";
+import { mkdir, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { writeAtomically } from "./hostsfile.ts";
@@ -18,7 +18,18 @@ export interface ChromeDeps {
   extensionDir: string;
   /** Chrome's per-user NativeMessagingHosts folder. */
   nativeHostsDir: string;
-  openFolder(path: string): Promise<void>;
+  /** Chrome's user data folder, with a folder per profile. focus only ever reads it. */
+  profilesDir: string;
+  /** Opens a Finder window with `path` selected, ready to drag. */
+  reveal(path: string): Promise<void>;
+  /**
+   * Opens a URL in Google Chrome; resolves false if that didn't work (Chrome isn't installed).
+   * Chrome accepts chrome:// pages only this way: it ignores them as command-line arguments,
+   * and it doesn't register the chrome: scheme, so a terminal link to one can't open.
+   */
+  openInChrome(url: string): Promise<boolean>;
+  /** Resolves false if it couldn't copy. */
+  copyToClipboard(text: string): Promise<boolean>;
 }
 
 export function defaultChromePaths(home = homedir()) {
@@ -26,7 +37,41 @@ export function defaultChromePaths(home = homedir()) {
   return {
     extensionDir: join(support, "focus", "chrome-extension"),
     nativeHostsDir: join(support, "Google", "Chrome", "NativeMessagingHosts"),
+    profilesDir: join(support, "Google", "Chrome"),
   };
+}
+
+export interface LoadedExtension {
+  /** The profile's name as Chrome shows it, e.g. "Person 1". */
+  profile: string;
+  incognito: boolean;
+}
+
+/**
+ * The Chrome profiles that have the extension in `extensionDir` loaded (with Load unpacked),
+ * from each profile's Secure Preferences. Chrome saves these about 10 seconds after a change.
+ * Read only; an unreadable or unfamiliar profile counts as not having it.
+ */
+export async function findLoadedExtension(profilesDir: string, id: string, extensionDir: string): Promise<LoadedExtension[]> {
+  const target = await realpath(extensionDir).catch(() => extensionDir);
+  const localState = await Bun.file(join(profilesDir, "Local State"))
+    .json()
+    .catch(() => null);
+  const names: Record<string, { name?: unknown }> = localState?.profile?.info_cache ?? {};
+  const folders = await readdir(profilesDir).catch(() => [] as string[]);
+  const found: LoadedExtension[] = [];
+  for (const folder of folders.filter((name) => name === "Default" || /^Profile \d+$/.test(name)).sort()) {
+    const prefs = await Bun.file(join(profilesDir, folder, "Secure Preferences"))
+      .json()
+      .catch(() => null);
+    const entry = prefs?.extensions?.settings?.[id];
+    if (typeof entry?.path !== "string") continue;
+    const path = await realpath(entry.path).catch(() => entry.path);
+    if (path !== target) continue;
+    const name = names[folder]?.name;
+    found.push({ profile: typeof name === "string" ? name : folder, incognito: entry.incognito === true });
+  }
+  return found;
 }
 
 /** Chrome's extension id for a manifest `key`: the first 128 bits of its SHA-256, as letters a-p. */

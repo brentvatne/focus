@@ -4,7 +4,9 @@ import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   type ChromeDeps,
+  type LoadedExtension,
   defaultChromePaths,
+  findLoadedExtension,
   isDirectory,
   readExtensionId,
   removeChromeFiles,
@@ -49,6 +51,7 @@ import {
   readAllowlist,
   writeAllowlist,
 } from "./subreddits.ts";
+import { SPINNER, fileUrl, hyperlink, styles, supportsHyperlinks } from "./terminal.ts";
 import { UpgradeError, type UpgradeProgress, type UpgradeResult, upgrade } from "./upgrade.ts";
 import { VERSION } from "./version.ts";
 
@@ -99,8 +102,13 @@ export interface Io {
   stderr(text: string): void;
   env: Record<string, string | undefined>;
   color: boolean;
+  /** stdout is a terminal, so it can show links. */
+  stdoutIsTerminal: boolean;
   /** stderr is a terminal, so progress can redraw a single line instead of printing one per step. */
   stderrIsTerminal: boolean;
+  sleep(ms: number): Promise<void>;
+  /** Watches for the Enter key; `pressed` never resolves without a terminal. Call `stop` when done. */
+  watchEnter(): { pressed: Promise<void>; stop(): void };
   /** Called after /etc/hosts itself (never any other file) has been rewritten. */
   flushDns(): Promise<void>;
   /** Asks which presets to block; resolves to their ids, or null if cancelled. Absent without a terminal. */
@@ -250,7 +258,7 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
       io.stdout("Sync:       needed, the presets changed in this version; run `focus sync`\n");
     }
     // Root never reads the allowlist; it's the user's file and only the extension uses it.
-    if (!io.isRoot) io.stdout(await formatSubreddits(io.chrome.allowlistPath, current));
+    if (!io.isRoot) io.stdout((await formatSubreddits(io.chrome.allowlistPath, current)) + (await formatExtension(io)));
     io.stdout(formatConfig(loaded));
     return 0;
   }
@@ -396,31 +404,25 @@ async function reddit(args: string[], hostsPath: string, dryRun: boolean, io: Io
       }
       const binary = await realpath(io.binaryPath);
       const { extensionDir, extensionSource, nativeHostsDir } = io.chrome;
+      const id = await readExtensionId(extensionSource);
       await writeExtension(extensionSource, extensionDir, VERSION);
-      const manifest = await writeNativeHostManifest(nativeHostsDir, binary, await readExtensionId(extensionSource));
-      io.stdout(
-        `Wrote the Chrome extension to ${extensionDir}\n` +
-          `Registered focus with Chrome in ${manifest}\n\n` +
-          "To finish in Chrome (once):\n" +
-          "  1. Open chrome://extensions and turn on Developer mode.\n" +
-          `  2. Click "Load unpacked" and choose the folder above. It's open in Finder; in the\n` +
-          "     file picker, press Cmd-Shift-G and paste the path.\n" +
-          `  3. Click Details on "focus: allowed subreddits" and turn on "Allow in Incognito".\n\n` +
-          "Then:\n" +
-          "  focus reddit allow <name>       for each subreddit you want\n" +
-          "  focus remove reddit             the hosts file would otherwise block all of Reddit\n" +
-          "Check that an allowed subreddit loads and another shows focus's blocked page. If it\n" +
-          "doesn't, `focus add reddit` blocks all of Reddit again.\n",
-      );
-      await io.chrome.openFolder(extensionDir).catch(() => {});
+      await writeNativeHostManifest(nativeHostsDir, binary, id);
+      await finishChromeSetup(id, hostsPath, io);
       return 0;
     }
     case "uninstall": {
       if (names.length > 0) throw new UsageError("reddit uninstall takes no arguments");
+      // Read before removing the folder: its manifest has the id.
+      const loaded = await chromeProfiles(io);
+      const id = await readExtensionId(io.chrome.extensionDir).catch(() => null);
       const removed = await removeChromeFiles(io.chrome);
+      const opened = loaded.length > 0 && id !== null && (await io.chrome.openInChrome(`chrome://extensions/?id=${id}`).catch(() => false));
       io.stdout(
-        (removed.length > 0 ? removed.map((file) => `Removed ${file}\n`).join("") : "Nothing to remove.\n") +
-          `Remove "focus: allowed subreddits" at chrome://extensions too. Your allowlist stays in ${path}.\n` +
+        (removed.length > 0 ? removed.map((file) => `Removed ${tildify(file, io.env.HOME)}\n`).join("") : "Nothing to remove.\n") +
+          (loaded.length > 0
+            ? `Chrome still lists "focus: allowed subreddits" (${profileNames(loaded)}); click Remove ${opened ? "on its details page, which is open" : "at chrome://extensions"}.\n`
+            : "") +
+          `Your allowlist stays in ${tildify(path, io.env.HOME)}.\n` +
           "To block all of Reddit again: focus add reddit\n",
       );
       return 0;
@@ -452,6 +454,111 @@ function parseSubreddits(args: string[], command: string): string[] {
 }
 
 /** Points out the two setups in which the allowlist does nothing. */
+const GUIDE_URL = "https://github.com/brentvatne/focus/blob/main/docs/guide.md#allowing-subreddits-chrome";
+/** How long `reddit install` waits for each step in Chrome before giving up. */
+const CHROME_WAIT_MS = 10 * 60 * 1000;
+const POLL_MS = 250;
+
+/**
+ * Walks through the steps only Chrome can do: it opens the pages and the folder, then (in a
+ * terminal) waits for Chrome to record each step, so you see it worked without leaving.
+ */
+async function finishChromeSetup(id: string, hostsPath: string, io: Io): Promise<void> {
+  const { extensionDir, profilesDir } = io.chrome;
+  const s = styles(io.color);
+  const links = supportsHyperlinks(io.env, io.stdoutIsTerminal);
+  const interactive = io.stdoutIsTerminal && io.stderrIsTerminal;
+  const done = (text: string) => io.stdout(`${s.green("✓")} ${text}\n`);
+  const shortPath = tildify(extensionDir, io.env.HOME);
+  const find = () => findLoadedExtension(profilesDir, id, extensionDir);
+
+  done(`Wrote the extension to ${hyperlink(shortPath, fileUrl(extensionDir), links)}`);
+  done("Registered focus with Chrome");
+
+  let loaded = await find();
+  if (loaded.length > 0) {
+    done(`Chrome already has it loaded (${profileNames(loaded)})`);
+  } else {
+    const opened = await io.chrome.openInChrome("chrome://extensions/").catch(() => false);
+    await io.chrome.reveal(extensionDir).catch(() => {});
+    const copied = interactive && (await io.chrome.copyToClipboard(extensionDir).catch(() => false));
+    io.stdout(
+      `\n${s.bold("Load it in Chrome")}${opened ? s.dim(" (chrome://extensions is open)") : ""}\n` +
+        `  1. ${opened ? "Turn on" : "Open chrome://extensions in Google Chrome and turn on"} ${s.bold("Developer mode")}, top right.\n` +
+        `  2. Drag the ${s.bold("chrome-extension")} folder from Finder onto the page.\n` +
+        `     Or click ${s.bold("Load unpacked")}, press ⌘⇧G, ${copied ? "paste (the path is on your clipboard)" : `type ${shortPath}`}, then Return.\n`,
+    );
+    if (interactive) {
+      loaded = await waitForChrome("Waiting for Chrome to load it", io, async () => {
+        const found = await find();
+        return found.length > 0 ? found : null;
+      }) ?? [];
+      if (loaded.length > 0) done(`Chrome loaded it (${profileNames(loaded)})`);
+    }
+  }
+
+  if (loaded.length > 0 && !loaded.some((profile) => profile.incognito)) {
+    const opened = await io.chrome.openInChrome(`chrome://extensions/?id=${id}`).catch(() => false);
+    io.stdout(
+      `\n${s.bold("Allow it in Incognito")} ${s.dim(opened ? "(its details page is open; skip this if you don't use Incognito)" : "(skip this if you don't use Incognito)")}\n` +
+        `  Turn on ${s.bold("Allow in Incognito")}${opened ? "" : ` at chrome://extensions/?id=${id}`}.\n`,
+    );
+    if (interactive) {
+      const allowed = await waitForChrome("Waiting for Incognito access", io, async () =>
+        (await find()).some((profile) => profile.incognito) ? true : null,
+      );
+      if (allowed) done("Allowed in Incognito");
+    }
+  }
+
+  const steps: [string, string][] = [];
+  if ((await readAllowlist(io.chrome.allowlistPath)).allow.length === 0) {
+    steps.push(["focus reddit allow <name...>", "choose the subreddits to keep"]);
+  }
+  const section = readSection((await readHostsFile(hostsPath)).content);
+  if (section && blocksReddit(section)) {
+    steps.push(["focus remove reddit", "stop the hosts file from blocking all of Reddit"]);
+  }
+  if (loaded.length === 0) steps.push(["focus status", "check that Chrome has loaded it"]);
+  if (steps.length > 0) {
+    const width = Math.max(...steps.map(([command]) => command.length));
+    io.stdout(`\n${s.bold("Then")}\n${steps.map(([command, why]) => `  ${command.padEnd(width)}  ${s.dim(why)}\n`).join("")}`);
+  }
+  io.stdout(`\n${s.dim("More, including how to undo it:")} ${hyperlink(links ? "the guide" : GUIDE_URL, GUIDE_URL, links)}\n`);
+}
+
+/**
+ * Polls `check` until it returns something other than null, with a spinner on stderr.
+ * Enter or the time limit stops it early; resolves null then.
+ */
+async function waitForChrome<T>(label: string, io: Io, check: () => Promise<T | null>): Promise<T | null> {
+  const status = statusLine(io);
+  const enter = io.watchEnter();
+  let skipped = false;
+  void enter.pressed.then(() => (skipped = true));
+  try {
+    for (let elapsed = 0, frame = 0; elapsed < CHROME_WAIT_MS && !skipped; elapsed += POLL_MS, frame++) {
+      const result = await check();
+      if (result !== null) return result;
+      const hint = elapsed >= 3000 ? " (Chrome saves this within about 10 seconds; Enter skips)" : "";
+      status.show({ step: "waiting", text: `${SPINNER[frame % SPINNER.length]} ${label}…${hint}` });
+      await io.sleep(POLL_MS);
+    }
+    return null;
+  } finally {
+    enter.stop();
+    status.clear();
+  }
+}
+
+function profileNames(loaded: LoadedExtension[]): string {
+  return `${loaded.length === 1 ? "profile" : "profiles"} ${loaded.map((profile) => profile.profile).join(", ")}`;
+}
+
+function tildify(path: string, home: string | undefined): string {
+  return home && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
+}
+
 async function warnAboutRedditSetup(hostsPath: string, io: Io): Promise<void> {
   const section = readSection((await readHostsFile(hostsPath)).content);
   if (!section || isEmpty(section)) {
@@ -464,7 +571,23 @@ async function warnAboutRedditSetup(hostsPath: string, io: Io): Promise<void> {
   }
   if (!(await isDirectory(io.chrome.extensionDir))) {
     io.stderr("focus: the Chrome extension isn't set up yet; run `focus reddit install`\n");
+  } else if ((await chromeProfiles(io)).length === 0) {
+    io.stderr("focus: Chrome hasn't loaded the extension yet; run `focus reddit install` to finish setting it up\n");
   }
+}
+
+async function chromeProfiles(io: Io): Promise<LoadedExtension[]> {
+  const id = await readExtensionId(io.chrome.extensionDir).catch(() => null);
+  return id ? findLoadedExtension(io.chrome.profilesDir, id, io.chrome.extensionDir) : [];
+}
+
+/** The status line for the extension, once it's been installed. */
+async function formatExtension(io: Io): Promise<string> {
+  if (!(await isDirectory(io.chrome.extensionDir))) return "";
+  const loaded = await chromeProfiles(io);
+  if (loaded.length === 0) return "Extension:  not loaded in Chrome; run `focus reddit install` to finish\n";
+  const incognito = loaded.some((profile) => profile.incognito) ? "allowed in Incognito" : "not allowed in Incognito";
+  return `Extension:  loaded in Chrome (${profileNames(loaded)}), ${incognito}\n`;
 }
 
 async function formatSubreddits(path: string, section: FocusSection | null): Promise<string> {
@@ -829,7 +952,27 @@ if (import.meta.main) {
     stderr: (text) => process.stderr.write(text),
     env: process.env,
     color: process.stdout.isTTY === true && !process.env.NO_COLOR,
+    stdoutIsTerminal: process.stdout.isTTY === true,
     stderrIsTerminal: process.stderr.isTTY === true,
+    sleep: (ms) => Bun.sleep(ms),
+    watchEnter: () => {
+      if (!process.stdin.isTTY) return { pressed: new Promise<void>(() => {}), stop: () => {} };
+      let onData: (chunk: Buffer) => void = () => {};
+      const pressed = new Promise<void>((resolve) => {
+        onData = (chunk) => {
+          if (chunk.includes(10) || chunk.includes(13)) resolve();
+        };
+      });
+      process.stdin.on("data", onData);
+      process.stdin.resume();
+      return {
+        pressed,
+        stop: () => {
+          process.stdin.off("data", onData);
+          process.stdin.pause();
+        },
+      };
+    },
     flushDns: flushMacDnsCache,
     selectPresets: process.stdin.isTTY && process.stdout.isTTY ? promptForPresets : undefined,
     upgrade: (dryRun, progress) =>
@@ -859,7 +1002,9 @@ if (import.meta.main) {
       // `--asset ./extension` puts the files beside the compiled code; from source they're in the repo.
       extensionSource: Bun.main.startsWith("/$bunfs/") ? join(import.meta.dir, "extension") : join(import.meta.dir, "..", "extension"),
       ...defaultChromePaths(),
-      openFolder: async (path) => void (await Bun.$`open ${path}`.quiet().nothrow()),
+      reveal: async (path) => void (await Bun.$`open -R ${path}`.quiet().nothrow()),
+      openInChrome: async (url) => (await Bun.$`open -a ${"Google Chrome"} ${url}`.quiet().nothrow()).exitCode === 0,
+      copyToClipboard: async (text) => (await Bun.$`printf %s ${text} | pbcopy`.quiet().nothrow()).exitCode === 0,
     },
     nativeMessaging: {
       input: () => Bun.stdin.stream(),

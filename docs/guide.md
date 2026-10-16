@@ -209,14 +209,15 @@ The hosts file can't do this itself. Every subreddit is a path on the same hostn
 ### Setting it up
 
 ```bash
-focus reddit install                 # writes the extension and registers focus with Chrome
+focus reddit install
 ```
 
-Then, once, in Chrome:
+This writes the extension to `~/Library/Application Support/focus/chrome-extension`, registers focus with Chrome, and walks you through the two steps only Chrome can do. It opens `chrome://extensions` in Chrome and shows the folder in Finder, then waits while you:
 
-1. Open `chrome://extensions` and turn on **Developer mode**.
-2. Click **Load unpacked** and choose `~/Library/Application Support/focus/chrome-extension`. `install` opens it in Finder; in the file picker, press Cmd-Shift-G and paste the path.
-3. Click **Details** on "focus: allowed subreddits" and turn on **Allow in Incognito**.
+1. Turn on **Developer mode** and drag the `chrome-extension` folder onto the page. Or click **Load unpacked**, press ⌘⇧G and paste the path, which `install` copies to your clipboard.
+2. Turn on **Allow in Incognito** on the extension's details page, which `install` opens once Chrome has loaded it. Skip this if you don't use Incognito.
+
+Each step gets a ✓ once Chrome has saved it, which takes up to about 10 seconds. Press Enter to stop waiting. If the extension is already loaded, `install` skips these steps, and `focus status` shows whether Chrome has it loaded and allowed in Incognito.
 
 Then choose subreddits, and turn off the DNS block, which would otherwise stop every subreddit before Chrome sees it:
 
@@ -251,6 +252,8 @@ While focus is on:
 
 - **Blocking:** the extension uses Chrome's declarativeNetRequest rules to block Reddit pages that aren't allowed, and shows its own page explaining why. It never blocks Reddit's scripts, images, video or API calls, so allowed subreddits keep working when Reddit changes its site. Reddit sometimes changes pages without a full reload; the extension notices and sends those tabs to the blocked page, so a page can flash briefly first.
 - **The list:** it lives in `~/.config/focus/subreddits.json`, which belongs to you. It's separate from `/etc/hosts` and from `config.json`, and root never reads it.
+- **Knowing what Chrome did:** focus reads each Chrome profile's `Secure Preferences` (never writes it) to see whether the extension is loaded from its folder and allowed in Incognito.
+- **Opening Chrome's pages:** `chrome://` pages can't be links in a terminal, because Chrome doesn't register that scheme with macOS, and Chrome ignores them as command-line arguments. focus opens them with `open -a "Google Chrome"`, which Chrome does accept.
 - **On or off:** the extension asks focus whether blocking is on and what's allowed. Chrome starts the focus binary for each question (native messaging), and focus reads `/etc/hosts` and the list, answers and exits. Nothing keeps running. The extension remembers the last answer, so if focus can't be reached, it keeps the last rules.
 - **A broken list:** if `subreddits.json` can't be read, focus answers with an empty list and the blocked page says why. While focus is on, that blocks every subreddit; `focus off` still turns blocking off.
 - **Incognito:** the extension's own pages can't open in Incognito windows, so a blocked page there shows Chrome's "blocked" error page instead, sometimes for Reddit's home page rather than the link itself.
@@ -275,7 +278,7 @@ focus reddit uninstall           # removes the extension's folder and focus's re
 focus add reddit                 # blocks all of Reddit again
 ```
 
-Then remove "focus: allowed subreddits" at `chrome://extensions`. Your list stays in `~/.config/focus/subreddits.json`.
+If Chrome still has the extension loaded, `uninstall` opens its details page so you can click **Remove**. Your list stays in `~/.config/focus/subreddits.json`.
 
 ## Manual recovery
 

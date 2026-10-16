@@ -24,7 +24,8 @@ focus add instagram      # turn on one more preset (`focus remove` turns it off)
 focus add example.com    # block anything else
 focus                    # toggle blocking on or off
 focus off                # take a break; `focus on` to resume
-focus reddit allow rust  # keep chosen subreddits in Chrome (setup in the guide)
+focus reddit install     # once: keep chosen subreddits in Chrome, set up step by step
+focus reddit allow rust  # then choose them
 focus status
 focus upgrade
 ```

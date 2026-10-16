@@ -45,7 +45,14 @@ async function focusWith(overrides: Partial<Io>, ...argv: string[]) {
     // Always point at temp files so tests can never fall through to /etc/hosts or the real user config.
     env: { FOCUS_HOSTS_FILE: hostsFile, FOCUS_CONFIG: configFile },
     color: false,
+    stdoutIsTerminal: false,
     stderrIsTerminal: false,
+    sleep: async () => {
+      throw new Error("tests must stub sleep");
+    },
+    watchEnter: () => {
+      throw new Error("tests must stub watchEnter");
+    },
     flushDns: async () => void flushes++,
     upgrade: async () => {
       throw new Error("tests must stub upgrade; it would reach GitHub");
@@ -77,8 +84,15 @@ async function focusWith(overrides: Partial<Io>, ...argv: string[]) {
       extensionSource: EXTENSION_SOURCE,
       extensionDir: join(dir, "chrome-extension"),
       nativeHostsDir: join(dir, "NativeMessagingHosts"),
-      openFolder: async () => {
-        throw new Error("tests must stub chrome.openFolder");
+      profilesDir: join(dir, "Chrome"),
+      reveal: async () => {
+        throw new Error("tests must stub chrome.reveal");
+      },
+      openInChrome: async () => {
+        throw new Error("tests must stub chrome.openInChrome");
+      },
+      copyToClipboard: async () => {
+        throw new Error("tests must stub chrome.copyToClipboard; it would change the real clipboard");
       },
     },
     nativeMessaging: {
@@ -991,35 +1005,168 @@ describe("reddit", () => {
     expect(result.code).toBe(0);
   });
 
-  test("install writes the extension and registers the binary with Chrome", async () => {
-    const binary = join(dir, "focus-bin");
-    await Bun.write(binary, "");
+  /** A stand-in for Chrome and the Mac: records what focus opens, and can play Chrome saving its profile. */
+  function fakeChrome() {
     const opened: string[] = [];
+    const revealed: string[] = [];
+    const copied: string[] = [];
     const chrome = {
       allowlistPath: allowlist(),
       extensionSource: EXTENSION_SOURCE,
       extensionDir: join(dir, "chrome-extension"),
       nativeHostsDir: join(dir, "NativeMessagingHosts"),
-      openFolder: async (path: string) => void opened.push(path),
+      profilesDir: join(dir, "Chrome"),
+      reveal: async (path: string) => void revealed.push(path),
+      openInChrome: async (url: string) => (opened.push(url), true),
+      copyToClipboard: async (text: string) => (copied.push(text), true),
     };
-    const result = await focusWith({ binaryPath: binary, chrome }, "reddit", "install");
+    /** What Chrome writes when the extension is loaded in a profile. */
+    const saveProfile = async (incognito: boolean, folder = "Default", name = "Person 1") => {
+      await Bun.write(join(chrome.profilesDir, "Local State"), JSON.stringify({ profile: { info_cache: { [folder]: { name } } } }));
+      const settings = { [ID]: { location: 4, path: chrome.extensionDir, incognito } };
+      await Bun.write(join(chrome.profilesDir, folder, "Secure Preferences"), JSON.stringify({ extensions: { settings } }));
+    };
+    return { chrome, opened, revealed, copied, saveProfile };
+  }
+
+  const ID = "ppkaiojneebcgfinkmccagdflccineob";
+
+  async function binary() {
+    const path = join(dir, "focus-bin");
+    await Bun.write(path, "");
+    return path;
+  }
+
+  /** A terminal session where each poll is one sleep; `onSleep` plays Chrome by poll number. */
+  function terminal(onSleep: (call: number) => Promise<void> | void, enter = false) {
+    let calls = 0;
+    return {
+      stdoutIsTerminal: true,
+      stderrIsTerminal: true,
+      sleep: async () => void (await onSleep(++calls)),
+      watchEnter: () => ({ pressed: enter ? Promise.resolve() : new Promise<void>(() => {}), stop: () => {} }),
+    };
+  }
+
+  test("install writes the extension, registers the binary, and opens what Chrome needs", async () => {
+    const fake = fakeChrome();
+    const path = await binary();
+    const result = await focusWith({ binaryPath: path, chrome: fake.chrome }, "reddit", "install");
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("Load unpacked");
-    expect(opened).toEqual([chrome.extensionDir]);
-    expect(await Bun.file(join(chrome.extensionDir, "manifest.json")).json()).toMatchObject({ version_name: VERSION });
-    expect(await Bun.file(join(chrome.nativeHostsDir, "com.brentvatne.focus.json")).json()).toEqual({
+    expect(fake.opened).toEqual(["chrome://extensions/"]);
+    expect(fake.revealed).toEqual([fake.chrome.extensionDir]);
+    // Not in a terminal: the clipboard is left alone and nothing waits.
+    expect(fake.copied).toEqual([]);
+    expect(result.stdout).toContain(`✓ Wrote the extension to ${fake.chrome.extensionDir}\n✓ Registered focus with Chrome\n`);
+    expect(result.stdout).toContain("Load it in Chrome (chrome://extensions is open)");
+    expect(result.stdout).toContain(`Load unpacked, press ⌘⇧G, type ${fake.chrome.extensionDir}, then Return.`);
+    expect(result.stdout).toContain("focus reddit allow <name...>  choose the subreddits to keep");
+    expect(result.stdout).toContain("focus status                  check that Chrome has loaded it");
+    expect(result.stdout).not.toContain("\x1b");
+    expect(await Bun.file(join(fake.chrome.extensionDir, "manifest.json")).json()).toMatchObject({ version_name: VERSION });
+    expect(await Bun.file(join(fake.chrome.nativeHostsDir, "com.brentvatne.focus.json")).json()).toEqual({
       name: "com.brentvatne.focus",
       description: expect.any(String),
-      path: await realpath(binary),
+      path: await realpath(path),
       type: "stdio",
-      allowed_origins: ["chrome-extension://ppkaiojneebcgfinkmccagdflccineob/"],
+      allowed_origins: [`chrome-extension://${ID}/`],
     });
+  });
 
-    const uninstalled = await focusWith({ chrome }, "reddit", "uninstall");
-    expect(uninstalled.stdout).toContain(`Removed ${chrome.extensionDir}`);
+  test("install tells you to open chrome://extensions yourself when Chrome can't be opened", async () => {
+    const fake = fakeChrome();
+    const chrome = { ...fake.chrome, openInChrome: async () => false };
+    const result = await focusWith({ binaryPath: await binary(), chrome }, "reddit", "install");
+    expect(result.stdout).toContain("Load it in Chrome\n  1. Open chrome://extensions in Google Chrome and turn on Developer mode");
+  });
+
+  test("in a terminal, install waits for Chrome to load it, then for Incognito access", async () => {
+    const fake = fakeChrome();
+    const session = terminal(async (call) => {
+      if (call === 3) await fake.saveProfile(false);
+      if (call === 5) await fake.saveProfile(true);
+    });
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome, ...session }, "reddit", "install");
+    expect(result.code).toBe(0);
+    expect(fake.copied).toEqual([fake.chrome.extensionDir]);
+    expect(fake.opened).toEqual(["chrome://extensions/", `chrome://extensions/?id=${ID}`]);
+    expect(result.stdout).toContain("press ⌘⇧G, paste (the path is on your clipboard), then Return.");
+    expect(result.stdout).toContain("✓ Chrome loaded it (profile Person 1)\n");
+    expect(result.stdout).toContain("Allow it in Incognito (its details page is open; skip this if you don't use Incognito)");
+    expect(result.stdout).toContain("✓ Allowed in Incognito\n");
+    expect(result.stdout).not.toContain("focus status");
+    expect(result.stderr).toContain("⠙ Waiting for Chrome to load it…");
+    expect(result.stderr).toContain("Waiting for Incognito access…");
+    expect(result.stderr).toEndWith("\r\x1b[K");
+  });
+
+  test("Enter stops waiting, and the steps still print", async () => {
+    const fake = fakeChrome();
+    const session = terminal(() => {}, true);
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome, ...session }, "reddit", "install");
+    expect(result.code).toBe(0);
+    expect(result.stdout).not.toContain("✓ Chrome loaded it");
+    expect(result.stdout).toContain("check that Chrome has loaded it");
+  });
+
+  test("install skips the Chrome steps when Chrome already has it", async () => {
+    const fake = fakeChrome();
+    await fake.saveProfile(true, "Profile 2", "Work");
+    await Bun.write(allowlist(), '{"version":1,"allow":["rust"]}');
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "reddit", "install");
+    expect(result.stdout).toContain("✓ Chrome already has it loaded (profile Work)\n");
+    expect(result.stdout).not.toContain("Load it in Chrome");
+    expect(result.stdout).not.toContain("Incognito");
+    expect(result.stdout).not.toContain("Then");
+    expect(fake.opened).toEqual([]);
+  });
+
+  test("install links the folder and the guide in terminals that support links", async () => {
+    const fake = fakeChrome();
+    const env = { FOCUS_HOSTS_FILE: hostsFile, FOCUS_CONFIG: configFile, TERM_PROGRAM: "iTerm.app" };
+    const session = terminal(() => {}, true);
+    const result = await focusWith({ binaryPath: await binary(), chrome: fake.chrome, env, ...session }, "reddit", "install");
+    expect(result.stdout).toContain(`\x1b]8;;file://${fake.chrome.extensionDir}\x1b\\${fake.chrome.extensionDir}\x1b]8;;\x1b\\`);
+    expect(result.stdout).toContain("\x1b]8;;https://github.com/brentvatne/focus/blob/main/docs/guide.md#allowing-subreddits-chrome\x1b\\the guide");
+  });
+
+  test("status and allow report whether Chrome has loaded the extension", async () => {
+    const fake = fakeChrome();
+    await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "reddit", "install");
+    await focus("add", "a.com");
+    const notLoaded = await focusWith({ chrome: fake.chrome }, "reddit", "allow", "rust");
+    expect(notLoaded.stderr).toContain("Chrome hasn't loaded the extension yet");
+    expect((await focusWith({ chrome: fake.chrome }, "status")).stdout).toContain(
+      "Extension:  not loaded in Chrome; run `focus reddit install` to finish\n",
+    );
+    await fake.saveProfile(false);
+    expect((await focusWith({ chrome: fake.chrome }, "status")).stdout).toContain(
+      "Extension:  loaded in Chrome (profile Person 1), not allowed in Incognito\n",
+    );
+    expect((await focusWith({ chrome: fake.chrome }, "reddit", "allow", "de")).stderr).toBe("");
+  });
+
+  test("a profile with the extension loaded from another folder doesn't count", async () => {
+    const fake = fakeChrome();
+    await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "reddit", "install");
+    await fake.saveProfile(true);
+    const prefs = join(fake.chrome.profilesDir, "Default", "Secure Preferences");
+    await Bun.write(prefs, (await Bun.file(prefs).text()).replace(fake.chrome.extensionDir, "/somewhere/else"));
+    expect((await focusWith({ chrome: fake.chrome }, "status")).stdout).toContain("Extension:  not loaded in Chrome");
+  });
+
+  test("uninstall removes the files and opens Chrome's page to remove it there", async () => {
+    const fake = fakeChrome();
+    await focusWith({ binaryPath: await binary(), chrome: fake.chrome }, "reddit", "install");
+    await fake.saveProfile(true);
+    fake.opened.length = 0;
+    const uninstalled = await focusWith({ chrome: fake.chrome }, "reddit", "uninstall");
+    expect(uninstalled.stdout).toContain(`Removed ${fake.chrome.extensionDir}`);
+    expect(uninstalled.stdout).toContain(`Chrome still lists "focus: allowed subreddits" (profile Person 1); click Remove on its details page, which is open.`);
+    expect(fake.opened).toEqual([`chrome://extensions/?id=${ID}`]);
     expect(await readdir(dir)).not.toContain("chrome-extension");
-    expect(await readdir(chrome.nativeHostsDir)).toEqual([]);
-    expect((await focusWith({ chrome }, "reddit", "uninstall")).stdout).toContain("Nothing to remove");
+    expect(await readdir(fake.chrome.nativeHostsDir)).toEqual([]);
+    expect((await focusWith({ chrome: fake.chrome }, "reddit", "uninstall")).stdout).toContain("Nothing to remove");
   });
 
   test("install refuses to run from source", async () => {
