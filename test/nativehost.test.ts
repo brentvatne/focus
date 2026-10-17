@@ -101,6 +101,13 @@ describe("respond", () => {
     expect(reply).not.toHaveProperty("error");
   });
 
+  test("an empty section, kept for Chrome settings alone, still reports its state", async () => {
+    await Bun.write(hosts, "127.0.0.1 localhost\n# BEGIN focus\n# state: on\n# END focus\n");
+    expect(await respond({ type: "status" }, deps())).toMatchObject({ state: "on" });
+    await Bun.write(hosts, "127.0.0.1 localhost\n# BEGIN focus\n# state: off\n# END focus\n");
+    expect(await respond({ type: "status" }, deps())).toMatchObject({ state: "off" });
+  });
+
   test("reports a malformed section as an error, never as off", async () => {
     await Bun.write(hosts, "# BEGIN focus\n0.0.0.0 x.com\n");
     expect(await respond({ type: "status" }, deps())).toMatchObject({ state: "error", error: expect.stringMatching(/malformed/) });

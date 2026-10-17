@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, stat, symlink } fr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Io, type Key, run } from "../src/cli.ts";
+import type { Mode, SiteRow, SitesChoice, SitesOptions } from "../src/prompt.ts";
 import { encodeMessage, readMessage } from "../src/nativehost.ts";
 import { UpgradeError, type UpgradeProgress } from "../src/upgrade.ts";
 import { VERSION } from "../src/version.ts";
@@ -14,6 +15,8 @@ const ORIGINAL = `##
 255.255.255.255\tbroadcasthost
 ::1             localhost
 `;
+const EMPTY_SECTION = (state: "on" | "off") =>
+  `# BEGIN focus\n# Managed by the focus CLI. To undo by hand, delete every line from BEGIN to END.\n# state: ${state}\n# END focus\n`;
 
 const EXTENSION_SOURCE = join(import.meta.dir, "..", "extension");
 
@@ -34,6 +37,25 @@ afterEach(async () => {
 });
 
 const focus = (...argv: string[]) => focusWith({}, ...argv);
+
+type Answer = (initial: Record<string, Mode>, rows: SiteRow[]) => SitesChoice | null;
+
+/**
+ * A stand-in for the per-site list: records each time it's shown, and answers with the next
+ * of `answers` (repeating the last). Values are { rowId: "off" | "whole" | "partial" }.
+ */
+function sitesList(...answers: Answer[]) {
+  const seen: { rows: SiteRow[]; initial: Record<string, Mode>; header?: string; focus?: string }[] = [];
+  return {
+    seen,
+    chooseSites: async (rows: SiteRow[], initial: Record<string, Mode>, options: SitesOptions) => {
+      seen.push({ rows: rows.map((row) => ({ ...row })), initial, header: options.header, focus: options.focus });
+      return answers[Math.min(seen.length - 1, answers.length - 1)]!(initial, rows);
+    },
+  };
+}
+/** Answer with the initial values changed by `changes`. */
+const set = (changes: Record<string, Mode>, add = false): Answer => (initial) => ({ values: { ...initial, ...changes }, add });
 
 async function focusWith(overrides: Partial<Io>, ...argv: string[]) {
   let stdout = "";
@@ -356,40 +378,45 @@ describe("init", () => {
 
   test("named presets replace the current ones and skip the prompt", async () => {
     await focus("init", "--yes");
-    let prompted = false;
-    const choose = async () => ((prompted = true), []);
-    expect((await focusWith({ choose }, "init", "messenger", "Reddit")).code).toBe(0);
-    expect(prompted).toBe(false);
+    const list = sitesList(() => null);
+    expect((await focusWith({ chooseSites: list.chooseSites }, "init", "messenger", "Reddit")).code).toBe(0);
+    expect(list.seen).toHaveLength(0);
     expect(await presetsLine()).toBe("Presets:    Reddit, Messenger");
     expect(await read()).not.toContain("facebook.com");
   });
 
-  test("the checklist starts from the current presets, and unchecking one removes it", async () => {
+  test("the list starts from the current presets, and turning one off removes it", async () => {
     await focus("init", "x", "youtube");
     await focus("add", "a.com");
-    let initial: string[] = [];
-    const choose = async (_: string, __: unknown, current: string[]) => ((initial = current), ["youtube", "hackernews"]);
-    expect((await focusWith({ choose }, "init")).code).toBe(0);
-    expect(initial).toEqual(["x", "youtube"]);
+    const list = sitesList(set({ x: "off", hackernews: "whole" }));
+    expect((await focusWith({ chooseSites: list.chooseSites }, "init")).code).toBe(0);
+    const { initial } = list.seen[0]!;
+    expect(Object.entries(initial).filter(([, mode]) => mode !== "off")).toEqual([
+      ["x", "whole"],
+      ["youtube", "whole"],
+      ["site:a.com", "whole"],
+    ]);
     expect(await presetsLine()).toBe("Presets:    YouTube, Hacker News");
     expect(await read()).not.toContain("x.com");
     expect((await focus("status")).stdout).toContain("Sites (2):\n  a.com\n  www.a.com\n");
   });
 
-  test("the checklist starts from the recommended presets on a fresh install", async () => {
-    let initial: string[] = [];
-    await focusWith({ choose: async (_: string, __: unknown, current: string[]) => ((initial = current), null) }, "init");
-    expect(initial).toEqual(["x", "facebook", "youtube", "reddit"]);
+  test("the list starts from the recommended presets on a fresh install", async () => {
+    const list = sitesList(() => null);
+    await focusWith({ chooseSites: list.chooseSites }, "init");
+    const on = Object.entries(list.seen[0]!.initial).filter(([, mode]) => mode !== "off");
+    expect(on.map(([id]) => id)).toEqual(["x", "facebook", "youtube", "reddit"]);
   });
 
-  test("unchecking every preset restores the original file", async () => {
+  test("turning every preset off restores the original file", async () => {
     await focus("init", "--yes");
-    expect((await focusWith({ choose: async () => [] }, "init")).code).toBe(0);
+    const off = Object.fromEntries(["x", "facebook", "youtube", "reddit"].map((id) => [id, "off" as const]));
+    expect((await focusWith({ chooseSites: sitesList(set(off)).chooseSites }, "init")).code).toBe(0);
     expect(await read()).toBe(ORIGINAL);
   });
 
-  test("cancelling the prompt changes nothing", async () => {
-    const result = await focusWith({ choose: async () => null }, "init");
+  test("cancelling the list changes nothing", async () => {
+    const result = await focusWith({ chooseSites: sitesList(() => null).chooseSites }, "init");
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("Cancelled");
     expect(await read()).toBe(ORIGINAL);
@@ -993,7 +1020,7 @@ describe("reddit", () => {
 
   test("allow warns when the hosts file makes the list ineffective", async () => {
     const nothing = await focus("reddit", "allow", "rust");
-    expect(nothing.stderr).toContain("nothing is blocked in the hosts file");
+    expect(nothing.stderr).toContain("focus isn't on yet; run `focus on` to start");
     expect(nothing.stderr).toContain("run `focus chrome install`");
 
     await focus("init", "reddit", "x");
@@ -1252,6 +1279,35 @@ describe("reddit", () => {
     expect(await read()).toBe(before);
   });
 
+  test("with only Chrome settings, focus on, off and the toggle work through an empty section", async () => {
+    await focus("feeds", "add", "youtube");
+    expect((await focus()).stdout).not.toContain("Usage:"); // the bare toggle turns it on
+    expect(await read()).toBe(ORIGINAL + EMPTY_SECTION("on"));
+    expect((await focus("status")).stdout).toContain("Blocking:   on (in Chrome only; nothing in the hosts file)\n");
+    await focus("off");
+    expect(await read()).toBe(ORIGINAL + EMPTY_SECTION("off"));
+    await focus("on");
+    expect(await read()).toBe(ORIGINAL + EMPTY_SECTION("on"));
+  });
+
+  test("without Chrome settings, removing the last site still restores the file exactly", async () => {
+    await focus("add", "a.com");
+    await focus("remove", "a.com");
+    expect(await read()).toBe(ORIGINAL);
+    expect((await focus("on")).stderr).toContain("nothing is listed yet");
+  });
+
+  test("through sudo, the Chrome settings are passed as --keep-empty, since root can't read them", async () => {
+    await focus("feeds", "add", "x");
+    const calls: string[][] = [];
+    await focusWith({ systemHostsFile: hostsFile, env: { FOCUS_CONFIG: configFile }, elevate: async (argv) => (calls.push(argv), 0) }, "on");
+    expect(calls).toEqual([["on", "--keep-empty"]]);
+    // As root, the flag is all it has to go on.
+    const root = await focusWith({ isRoot: true, systemHostsFile: hostsFile, env: { FOCUS_CONFIG: configFile } }, "on", "--keep-empty");
+    expect(root.code).toBe(0);
+    expect(await read()).toBe(ORIGINAL + EMPTY_SECTION("on"));
+  });
+
   test("feeds list says when nothing is blocked", async () => {
     expect((await focus("feeds", "list")).stdout).toBe("No feeds are blocked. Add one with `focus feeds add youtube x instagram`.\n");
   });
@@ -1296,7 +1352,8 @@ describe("reddit", () => {
     const result = await focusWith({ chrome: fake.chrome, ...terminal(["enter"]) }, "feeds", "add", "youtube", "x");
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("Press Enter to stop that (runs `focus remove x youtube`) (Esc skips) \n");
-    expect(await read()).toBe(ORIGINAL);
+    // No hosts left, but the Chrome settings keep the section for the on/off state.
+    expect(await read()).toBe(ORIGINAL + EMPTY_SECTION("on"));
     expect((await focusWith({ chrome: fake.chrome }, "status")).stdout).toContain("In Chrome:  YouTube feed only, X feed only\n");
   });
 
@@ -1400,79 +1457,154 @@ describe("reddit", () => {
     }
   });
 
-  /** A stand-in checklist: records what it was shown and answers with `pick` (given the initial values). */
-  function checklist(pick: (initial: string[]) => string[] | null) {
-    const seen: { message: string; groups: Record<string, { value: string; label: string }[]>; initial: string[] }[] = [];
-    return {
-      seen,
-      choose: async (message: string, groups: Record<string, { value: string; label: string }[]>, initial: string[]) => {
-        seen.push({ message, groups, initial });
-        return pick(initial);
-      },
-    };
-  }
-
-  test("config shows whole sites and the Chrome options, starting from what's set", async () => {
+  test("config shows one row per site, with its Chrome option where it has one, starting from what's set", async () => {
     await focus("init", "youtube", "x");
+    await focus("add", "example.com");
     await focus("feeds", "add", "instagram");
     await focus("reddit", "allow", "rust");
-    const list = checklist(() => null);
-    await focusWith({ choose: list.choose }, "config");
-    const [{ groups, initial }] = list.seen as [(typeof list.seen)[number]];
-    expect(Object.keys(groups)).toEqual(["Block the whole site", "Or, in Chrome, just part of it"]);
-    expect(groups["Or, in Chrome, just part of it"]!.map((choice) => choice.label)).toEqual([
-      "YouTube: feed only",
-      "X: feed only",
-      "Instagram: messages only",
-      "Reddit: chosen subreddits only",
+    const list = sitesList(() => null);
+    await focusWith({ chooseSites: list.chooseSites }, "config");
+    const { rows, initial, header } = list.seen[0]!;
+    expect(header).toBe("focus is on");
+    expect(rows.map((row) => `${row.name}: ${row.modes.map((option) => option.label).join(" / ")}`)).toEqual([
+      "X / Twitter: off / whole site / feed only",
+      "Facebook: off / whole site",
+      "YouTube: off / whole site / feed only",
+      "Reddit: off / whole site / chosen subreddits",
+      "Instagram: off / whole site / messages only",
+      "TikTok: off / whole site",
+      "LinkedIn: off / whole site",
+      "Hacker News: off / whole site",
+      "Messenger: off / whole site",
+      "example.com: off / blocked",
     ]);
-    expect(initial).toEqual(["x", "youtube", "feed:instagram", "reddit:subreddits"]);
+    expect(Object.entries(initial).filter(([, mode]) => mode !== "off")).toEqual([
+      ["x", "whole"],
+      ["youtube", "whole"],
+      ["reddit", "partial"],
+      ["instagram", "partial"],
+      ["site:example.com", "whole"],
+    ]);
+    expect(rows.find((row) => row.id === "reddit")!.modes[2]!.detail).toBe("Only r/rust load, in Chrome.");
   });
 
   test("config switches YouTube from the whole site to feed only", async () => {
     await focus("init", "youtube", "x");
-    const list = checklist(() => ["x", "feed:youtube"]);
-    const result = await focusWith({ choose: list.choose }, "config");
+    const result = await focusWith({ chooseSites: sitesList(set({ youtube: "partial" })).chooseSites }, "config");
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("✓ YouTube: feed only, in Chrome (videos still work)\n");
+    expect(result.stdout).toStartWith("✓ YouTube: feed only (in Chrome)\n");
     expect(await Bun.file(feedsFile()).json()).toEqual({ version: 1, feeds: ["youtube"] });
     expect(await presetsLineOf()).toBe("Presets:    X / Twitter");
     expect(result.stdout).toContain("Set it up with: focus chrome install");
+    // One summary, not the status block and backup path of each hosts change.
+    expect(result.stdout).not.toContain("Hosts file:");
+    expect(result.stdout).not.toContain("Previous version saved");
   });
 
-  test("config asks for subreddits when turning Reddit on, and keeps them when turning it off", async () => {
+  test("if the hosts change fails, the Chrome settings aren't changed either", async () => {
+    await focus("init", "youtube", "x");
+    await chmod(dir, 0o555); // the hosts file can't be replaced, as when sudo is cancelled
+    try {
+      const result = await focusWith({ chooseSites: sitesList(set({ youtube: "partial" })).chooseSites }, "config");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("the hosts file wasn't changed, so nothing else was either");
+      expect(result.stdout).not.toContain("✓");
+    } finally {
+      await chmod(dir, 0o755);
+    }
+    expect(await Bun.file(feedsFile()).exists()).toBe(false);
+    expect(await presetsLineOf()).toBe("Presets:    X / Twitter, YouTube");
+  });
+
+  test("config with only Chrome settings keeps the section, so focus on and off work", async () => {
+    const result = await focusWith({ chooseSites: sitesList(set({ youtube: "partial" })).chooseSites }, "config");
+    expect(result.code).toBe(0);
+    expect(await read()).toBe(ORIGINAL + EMPTY_SECTION("on"));
+    // And turning the last Chrome option off restores the file exactly.
+    await focusWith({ chooseSites: sitesList(set({ youtube: "off" })).chooseSites }, "config");
+    expect(await read()).toBe(ORIGINAL);
+    expect(await Bun.file(feedsFile()).json()).toEqual({ version: 1, feeds: [] });
+  });
+
+  test("config asks for subreddits before changing anything, and keeps them when Reddit is turned off", async () => {
     await focus("add", "a.com");
     let asked = "";
     const askText = async (message: string) => ((asked = message), "rust r/AskHistorians");
-    const on = await focusWith({ choose: checklist(() => ["reddit:subreddits"]).choose, askText }, "config");
+    const on = await focusWith({ chooseSites: sitesList(set({ reddit: "partial" })).chooseSites, askText }, "config");
     expect(asked).toContain("Which subreddits");
-    expect(on.stdout).toContain("✓ Reddit: only r/rust, r/askhistorians, in Chrome\n");
+    expect(on.stdout).toContain("✓ Reddit: chosen subreddits (in Chrome)\n");
     expect(await Bun.file(allowlist()).json()).toEqual({ version: 1, allow: ["rust", "askhistorians"] });
-    const off = await focusWith({ choose: checklist(() => []).choose }, "config");
-    expect(off.stdout).toContain("✓ Reddit: no longer restricted in Chrome; your list is kept\n");
+    await focusWith({ chooseSites: sitesList(set({ reddit: "off" })).chooseSites }, "config");
     expect(await Bun.file(allowlist()).json()).toEqual({ version: 1, enabled: false, allow: ["rust", "askhistorians"] });
     expect((await focus("status")).stdout).toContain("Subreddits: r/rust, r/askhistorians (off; turn it on with `focus config`)\n");
     // Back on: the list is still there, so nothing to ask.
     asked = "";
-    await focusWith({ choose: checklist(() => ["reddit:subreddits"]).choose, askText }, "config");
+    await focusWith({ chooseSites: sitesList(set({ reddit: "partial" })).chooseSites, askText }, "config");
     expect(asked).toBe("");
     expect(await Bun.file(allowlist()).json()).toEqual({ version: 1, allow: ["rust", "askhistorians"] });
   });
 
-  test("config says when a whole-site preset makes a Chrome option do nothing", async () => {
-    const result = await focusWith({ choose: checklist(() => ["youtube", "feed:youtube"]).choose }, "config");
-    expect(result.stdout).toContain("YouTube: the whole site is blocked, so the Chrome setting does nothing until you uncheck the whole site.");
+  test("cancelling the subreddit question changes nothing", async () => {
+    await focus("init", "reddit");
+    const result = await focusWith({ chooseSites: sitesList(set({ reddit: "partial" })).chooseSites, askText: async () => null }, "config");
+    expect(result.stdout).toBe("Cancelled; nothing was changed.\n");
+    expect(await presetsLineOf()).toBe("Presets:    Reddit");
+    expect(await Bun.file(allowlist()).exists()).toBe(false);
+  });
+
+  test("a site set both whole and in Chrome shows as whole, and leaving it alone keeps both", async () => {
+    await focus("init", "youtube");
+    await focus("feeds", "add", "youtube");
+    const list = sitesList(set({ x: "whole" }));
+    await focusWith({ chooseSites: list.chooseSites }, "config");
+    const youtube = list.seen[0]!.rows.find((row) => row.id === "youtube")!;
+    expect(list.seen[0]!.initial.youtube).toBe("whole");
+    expect(youtube.note).toBe("Its Chrome option is set too; the whole site wins.");
+    expect(await Bun.file(feedsFile()).json()).toEqual({ version: 1, feeds: ["youtube"] });
+  });
+
+  test("config adds and removes your own sites", async () => {
+    await focus("add", "old.example");
+    const askText = async () => "https://news.example.org/path";
+    const askHost = async () => "news.example.org";
+    let calls = 0;
+    const list = sitesList(set({}, true), set({ "site:old.example": "off" }));
+    const result = await focusWith(
+      { chooseSites: list.chooseSites, askText: async (...args: [string, string]) => (++calls === 1 ? askText() : askHost()) },
+      "config",
+    );
+    // A URL isn't a hostname: it says so and goes back to the list, which asks again.
+    expect(result.stdout).toContain("expected a hostname, not a URL");
+    expect(list.seen[1]!.focus).toBe("\0add");
+    expect(result.code).toBe(0);
+    expect((await focus("status")).stdout).not.toContain("old.example");
+    expect(list.seen.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("adding a preset's hostname points to its row instead", async () => {
+    const list = sitesList(set({}, true), () => null);
+    const result = await focusWith({ chooseSites: list.chooseSites, askText: async () => "youtube.com" }, "config");
+    expect(result.stdout).toContain("youtube.com is part of YouTube; set it on that row.");
+    expect(list.seen[1]!.focus).toBe("youtube");
+  });
+
+  test("an added site gets its own row, already blocked", async () => {
+    const list = sitesList(set({}, true), (initial) => ({ values: initial, add: false }));
+    await focusWith({ chooseSites: list.chooseSites, askText: async () => "news.example.org" }, "config");
+    expect(list.seen[1]!.rows.at(-1)!.name).toBe("news.example.org");
+    expect(list.seen[1]!.initial["site:news.example.org"]).toBe("whole");
+    expect((await focus("status")).stdout).toContain("news.example.org");
   });
 
   test("config with nothing changed says so", async () => {
     await focus("init", "x");
-    const result = await focusWith({ choose: checklist((initial) => initial).choose }, "config");
+    const result = await focusWith({ chooseSites: sitesList((initial) => ({ values: initial, add: false })).chooseSites }, "config");
     expect(result.stdout).toBe("No changes.\n");
   });
 
   test("config --dry-run shows the hosts diff and saves nothing", async () => {
-    const result = await focusWith({ choose: checklist(() => ["x", "feed:youtube"]).choose }, "config", "--dry-run");
-    expect(result.stdout).toContain("✓ YouTube: feed only, in Chrome (videos still work) (dry run: not saved)");
+    const result = await focusWith({ chooseSites: sitesList(set({ x: "whole", youtube: "partial" })).chooseSites }, "config", "--dry-run");
+    expect(result.stdout).toContain("✓ YouTube: feed only (in Chrome) (dry run: not saved)");
     expect(result.stdout).toContain("+0.0.0.0 x.com");
     expect(await Bun.file(feedsFile()).exists()).toBe(false);
     expect(await read()).toBe(ORIGINAL);
@@ -1484,25 +1616,26 @@ describe("reddit", () => {
     expect(result.stderr).toContain("config needs an interactive terminal");
   });
 
-  test("as root, config offers only whole sites", async () => {
-    const list = checklist(() => ["x"]);
-    await focusWith({ choose: list.choose, isRoot: true, systemHostsFile: hostsFile }, "config");
-    expect(Object.keys(list.seen[0]!.groups)).toEqual(["Block the whole site"]);
+  test("as root, config offers only off and whole", async () => {
+    const list = sitesList(set({ x: "whole" }));
+    await focusWith({ chooseSites: list.chooseSites, isRoot: true, systemHostsFile: hostsFile }, "config");
+    expect(list.seen[0]!.rows.every((row) => row.modes.length === 2)).toBe(true);
+    expect(await presetsLineOf()).toBe("Presets:    X / Twitter");
     expect(await Bun.file(feedsFile()).exists()).toBe(false);
   });
 
   test("init welcomes you, starts from the recommended presets, and ends with what's next", async () => {
-    const list = checklist((initial) => initial);
-    const result = await focusWith({ choose: list.choose }, "init");
+    const list = sitesList((initial) => ({ values: initial, add: false }));
+    const result = await focusWith({ chooseSites: list.chooseSites }, "init");
     expect(result.stdout).toStartWith("focus blocks distracting sites while it's on.");
-    expect(list.seen[0]!.initial).toEqual(["x", "facebook", "youtube", "reddit"]);
+    expect(result.stdout).toContain("✓ X / Twitter: whole site\n");
     expect(result.stdout).toContain("focus config      change what's blocked");
   });
 
   test("in a terminal, config offers to set up the extension the Chrome options need", async () => {
     const fake = fakeChrome();
     const result = await focusWith(
-      { choose: checklist(() => ["feed:x"]).choose, binaryPath: await binary(), chrome: fake.chrome, ...terminal(["enter", "skip"]) },
+      { chooseSites: sitesList(set({ x: "partial" })).chooseSites, binaryPath: await binary(), chrome: fake.chrome, ...terminal(["enter", "skip"]) },
       "config",
     );
     expect(result.code).toBe(0);

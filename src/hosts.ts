@@ -56,12 +56,14 @@ export function isEmpty(section: FocusSection): boolean {
 
 /**
  * Returns `content` with the focus section replaced by `next`. Passing null or an
- * empty section removes the section entirely, restoring the original file.
+ * empty section removes the section entirely, restoring the original file, unless
+ * `keepEmpty` is set: then an empty section stays, holding only the on/off state
+ * (for Chrome settings, which have no hosts of their own).
  */
-export function writeSection(content: string, next: FocusSection | null): string {
+export function writeSection(content: string, next: FocusSection | null, keepEmpty = false): string {
   const lines = content.split("\n");
   const located = locateSection(lines);
-  const empty = next === null || isEmpty(next);
+  const empty = next === null || (isEmpty(next) && !keepEmpty);
 
   if (located) {
     const replacement = empty ? [] : renderSection(next, located.crlf);

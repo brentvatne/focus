@@ -15,6 +15,7 @@ export const FEED_SITES = [
     preset: "youtube",
     mode: "feed only",
     keeps: "videos still work",
+    detail: "Home, Shorts and Explore blocked in Chrome; videos still work.",
     what: "the home page, Shorts and Explore, and recommendations on video pages",
   },
   {
@@ -23,6 +24,7 @@ export const FEED_SITES = [
     preset: "x",
     mode: "feed only",
     keeps: "posts and profiles still work",
+    detail: "Timeline, Explore and search blocked in Chrome; posts still work.",
     what: "the Home timeline, Explore, search and notifications",
   },
   {
@@ -31,6 +33,7 @@ export const FEED_SITES = [
     preset: "instagram",
     mode: "messages only",
     keeps: "everything else goes to your inbox",
+    detail: "In Chrome, everything but your messages goes to your inbox.",
     what: "everything but your messages, sending other pages to your inbox",
   },
 ] as const;

@@ -155,3 +155,22 @@ describe("writeSection", () => {
     expect(writeSection(MAC_DEFAULT, null)).toBe(MAC_DEFAULT);
   });
 });
+
+describe("writeSection with keepEmpty", () => {
+  const empty = (state: "on" | "off"): FocusSection => ({ state, presets: [], sites: [] });
+  const original = "127.0.0.1 localhost\n";
+
+  test("keeps an empty section, holding only the state, and reads it back", () => {
+    const written = writeSection(original, empty("on"), true);
+    expect(written).toBe(
+      original + "# BEGIN focus\n# Managed by the focus CLI. To undo by hand, delete every line from BEGIN to END.\n# state: on\n# END focus\n",
+    );
+    expect(readSection(written)).toMatchObject({ state: "on", presets: [], sites: [] });
+    expect(writeSection(written, empty("off"), true)).toContain("# state: off\n");
+  });
+
+  test("without it, an empty section still restores the file exactly", () => {
+    expect(writeSection(writeSection(original, empty("on"), true), empty("on"))).toBe(original);
+    expect(writeSection(original, empty("on"))).toBe(original);
+  });
+});

@@ -4,7 +4,7 @@ Block distracting websites on macOS. focus manages one marked section of `/etc/h
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/init-dark.png">
-  <img alt="focus init: a checklist with whole sites (X, Facebook and Reddit checked) and, in Chrome, just part of a site (YouTube: feed only checked)" src="docs/images/init-light.png" width="880">
+  <img alt="focus init: one row per site, each set to off, whole site, or part of it in Chrome; X and Facebook whole, YouTube feed only, Reddit chosen subreddits" src="docs/images/init-light.png" width="880">
 </picture>
 
 ## Install
@@ -21,7 +21,7 @@ Apple silicon only. Run `focus setup-sudo` once if you don't want to type your p
 ```bash
 focus                    # toggle blocking on or off
 focus off                # take a break; `focus on` to resume
-focus config             # change what's blocked: the same checklist as init
+focus config             # change what's blocked: the same list as init
 focus add example.com    # block anything else (`focus remove` unblocks it)
 focus status
 focus upgrade
@@ -42,7 +42,7 @@ focus reddit allow rust               # every subreddit but these goes
 focus chrome install                  # once: sets up the Chrome extension step by step
 ```
 
-`focus config` has the same options as checkboxes.
+`focus config` has the same options, one row per site.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/chrome-dark.png">

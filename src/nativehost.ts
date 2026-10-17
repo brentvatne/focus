@@ -4,7 +4,7 @@
 // allowlist. Its one write is refreshing the extension's own folder after an upgrade.
 import { PROTOCOL } from "../extension/rules.js";
 import { isDirectory, writeExtension } from "./chrome.ts";
-import { type FocusSection, HostsFormatError, isEmpty, readSection } from "./hosts.ts";
+import { type FocusSection, HostsFormatError, readSection } from "./hosts.ts";
 import { readHostsFile } from "./hostsfile.ts";
 import { FEED_SITES, readFeeds } from "./feeds.ts";
 import { readAllowlist } from "./subreddits.ts";
@@ -98,7 +98,8 @@ export async function respond(request: unknown, deps: NativeHostDeps): Promise<S
 
   try {
     const section = readSection((await readHostsFile(deps.systemHostsFile)).content);
-    reply.state = section && !isEmpty(section) ? section.state : "none";
+    // An empty section is kept for Chrome settings alone, so its state counts too.
+    reply.state = section ? section.state : "none";
     reply.redditBlockedByHosts = section !== null && blocksReddit(section);
   } catch (error) {
     reply.state = "error";

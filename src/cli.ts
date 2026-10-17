@@ -43,7 +43,7 @@ import {
   syncSection,
   withPresets,
 } from "./presets.ts";
-import { type Choice, askText, chooseOptions } from "./prompt.ts";
+import { type Mode, type SiteRow, type SitesChoice, type SitesOptions, askText, chooseSites } from "./prompt.ts";
 import {
   MAX_SUBREDDITS,
   SubredditError,
@@ -63,7 +63,7 @@ Block distracting websites by managing a marked section of /etc/hosts.
 
 Commands:
   (none)                  Toggle blocking: on if it's off, off if it's on
-  init [preset...]        Set focus up: a checklist of what to block. Names set the presets
+  init [preset...]        Set focus up: choose what to block, one row per site. Names set the presets
                           exactly instead. Presets: ${PRESETS.map((p) => p.id).join(", ")}
   config                  Change what's blocked: whole sites, and the Chrome options below
   add <host|preset...>    Block hostnames (and www.<host> unless --exact), or turn presets on
@@ -121,8 +121,8 @@ export interface Io {
   readKey(): { key: Promise<Key>; stop(): void };
   /** Called after /etc/hosts itself (never any other file) has been rewritten. */
   flushDns(): Promise<void>;
-  /** A grouped checklist for `config` and `init`; the checked values, or null if cancelled. Absent without a terminal. */
-  choose?(message: string, groups: Record<string, Choice[]>, initial: string[]): Promise<string[] | null>;
+  /** The per-site list for `config` and `init`, or null if cancelled. Absent without a terminal. */
+  chooseSites?(rows: SiteRow[], initial: Record<string, Mode>, options: SitesOptions): Promise<SitesChoice | null>;
   /** One line of text, or null if cancelled. Absent without a terminal. */
   askText?(message: string, placeholder: string): Promise<string | null>;
   upgrade(dryRun: boolean, progress: (event: UpgradeProgress) => void): Promise<UpgradeResult>;
@@ -179,6 +179,10 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
         "dry-run": { type: "boolean", short: "n" },
         exact: { type: "boolean" },
         "hosts-file": { type: "string" },
+        // Internal: passed through sudo when the user has Chrome settings, which root can't read.
+        "keep-empty": { type: "boolean" },
+        // Internal: `config` runs hosts changes with this and prints one summary of its own.
+        quiet: { type: "boolean" },
         flush: { type: "boolean" },
         help: { type: "boolean", short: "h" },
         preset: { type: "boolean" },
@@ -267,8 +271,8 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
     if (command === "chrome") return chrome(args, hostsPath, null, io);
     return reddit(args, hostsPath, hostsArgs, io);
   }
-  // The checklists run as you; whatever needs root is re-run through sudo once you've chosen.
-  if (command === "config" || (command === "init" && args.length === 0 && !values.yes && io.choose)) {
+  // The per-site list runs as you; whatever needs root is re-run through sudo once you've chosen.
+  if (command === "config" || (command === "init" && args.length === 0 && !values.yes && io.chooseSites)) {
     if (command === "config" && args.length > 0) throw new UsageError("config takes no arguments");
     const passthrough = [
       ...(values["hosts-file"] ? ["--hosts-file", values["hosts-file"]] : []),
@@ -277,13 +281,16 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
     ];
     return configure(command, hostsPath, passthrough, values["dry-run"] ?? false, io);
   }
+  // With Chrome settings, the section stays even with no hosts in it: it holds the on/off
+  // state the extension follows. Root can't read those settings, so it's told by flag.
+  const keepEmpty = values["keep-empty"] ?? (io.isRoot ? false : await usesChrome(io));
   // A bare `focus` with nothing to toggle shows help instead of asking sudo for nothing.
-  if (command === undefined && !readSection((await readHostsFile(hostsPath)).content)) {
+  if (command === undefined && !keepEmpty && !readSection((await readHostsFile(hostsPath)).content)) {
     io.stdout(USAGE + "\n");
     return 0;
   }
   if (!io.isRoot && targetsSystemHosts && (command === undefined || MUTATING_COMMANDS.has(command)) && !values["dry-run"]) {
-    return elevate(argv, io);
+    return elevate(keepEmpty && values["keep-empty"] === undefined ? [...argv, "--keep-empty"] : argv, io);
   }
 
   const sudoUid = io.isRoot && io.env.SUDO_UID ? Number(io.env.SUDO_UID) : undefined;
@@ -318,15 +325,15 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
   if (command === "init") {
     next = withPresets(current, choosePresets(args, values.yes ?? false, current));
   } else {
-    next = planChange(command, args, current, { exact, preset: values.preset ?? false }, io);
+    next = planChange(command, args, current, { exact, preset: values.preset ?? false, keepEmpty }, io);
   }
-  if (current?.state === "off" && next && [...allHosts(next)].some((host) => !allHosts(current).has(host))) {
+  if (!values.quiet && current?.state === "off" && next && [...allHosts(next)].some((host) => !allHosts(current).has(host))) {
     io.stderr("focus: blocking is off; run `focus on` to block these sites\n");
   }
 
-  const updated = writeSection(snapshot.content, next);
+  const updated = writeSection(snapshot.content, next, keepEmpty);
   if (updated === snapshot.content) {
-    io.stdout(`No changes to ${snapshot.path}.\n`);
+    if (!values.quiet) io.stdout(`No changes to ${snapshot.path}.\n`);
     return 0;
   }
 
@@ -346,8 +353,10 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
     }
     throw error;
   }
-  io.stdout(formatStatus(snapshot.path, next));
-  io.stdout(`Previous version saved to ${backupPath(snapshot)}.\n`);
+  if (!values.quiet) {
+    io.stdout(formatStatus(snapshot.path, next));
+    io.stdout(`Previous version saved to ${backupPath(snapshot)}.\n`);
+  }
 
   if (flush && targetsSystemHosts) {
     try {
@@ -604,9 +613,7 @@ async function updateExtensionFiles(io: Io): Promise<boolean> {
  */
 async function afterChromeChange(presetIds: string[], hostsPath: string, hostsArgs: string[], io: Io): Promise<number> {
   const section = readSection((await readHostsFile(hostsPath)).content);
-  if (!section || isEmpty(section)) {
-    io.stderr("focus: nothing is blocked in the hosts file, so `focus on` has nothing to turn on and Chrome won't restrict anything\n");
-  }
+  if (!section) io.stderr("focus: focus isn't on yet; run `focus on` to start\n");
   if (!(await isDirectory(io.chrome.extensionDir))) {
     io.stderr("focus: the Chrome extension isn't set up yet; run `focus chrome install`\n");
   } else if ((await chromeProfiles(io))?.length === 0) {
@@ -645,16 +652,17 @@ function parseSubreddits(args: string[], command: string): string[] {
 }
 
 /** Points out the two setups in which the allowlist does nothing. */
-const REDDIT_CHOICE = "reddit:subreddits";
+const ADD_ROW = "\0add";
 
 /**
- * `focus config`, and `focus init` as its first-run version: one checklist of everything focus
- * can block, starting from what's set now (or, for a first `init`, the recommended presets).
- * Chrome settings are written as you; the hosts file changes through `init` or `remove`, so
- * through sudo as usual. Root gets only the presets: the Chrome settings are your files.
+ * `focus config`, and `focus init` as its first-run version: one row per site, each set to
+ * off, the whole site (hosts file) or, for some, part of it in Chrome. Nothing is written
+ * until everything has been asked; then the hosts file changes first (through sudo, as
+ * usual), and the Chrome settings only once that has worked, so a cancelled password prompt
+ * leaves everything as it was. Root gets only off and whole: the Chrome settings are yours.
  */
 async function configure(kind: "config" | "init", hostsPath: string, passthrough: string[], dryRun: boolean, io: Io): Promise<number> {
-  if (!io.choose) {
+  if (!io.chooseSites) {
     throw new UsageError("config needs an interactive terminal; use add, remove, feeds and reddit instead");
   }
   const s = styles(io.color);
@@ -665,22 +673,29 @@ async function configure(kind: "config" | "init", hostsPath: string, passthrough
   const feedIds = chromeSettings ? await readFeeds(io.chrome.feedsPath) : [];
   const list = chromeSettings ? await readAllowlist(io.chrome.allowlistPath) : null;
   const redditOn = list !== null && list.found && list.enabled;
+  const partialOn = (presetId: string) =>
+    presetId === "reddit" ? redditOn : feedIds.some((id) => findFeedSite(id)!.preset === presetId);
 
-  const firstRun = kind === "init" && currentPresets.length === 0 && (!synced || isEmpty(synced)) && feedIds.length === 0 && !list?.found;
-  const initial = firstRun
-    ? recommendedPresets()
-    : [...currentPresets, ...feedIds.map((id) => `feed:${id}`), ...(redditOn ? [REDDIT_CHOICE] : [])];
-
-  const groups: Record<string, Choice[]> = {
-    "Block the whole site": PRESETS.map((preset) => ({ value: preset.id, label: preset.name, hint: preset.note })),
-  };
-  if (chromeSettings) {
-    groups["Or, in Chrome, just part of it"] = [
-      ...FEED_SITES.map((site) => ({ value: `feed:${site.id}`, label: `${site.name}: ${site.mode}`, hint: site.keeps })),
-      { value: REDDIT_CHOICE, label: "Reddit: chosen subreddits only", hint: "every other subreddit is blocked" },
-    ];
+  // What's on disk now, row by row: the baseline for what changes.
+  const rows: SiteRow[] = PRESETS.map((preset) => presetRow(preset, chromeSettings, list?.allow ?? [], currentPresets.includes(preset.id) && partialOn(preset.id)));
+  const onDisk: Record<string, Mode> = {};
+  for (const preset of PRESETS) {
+    onDisk[preset.id] = currentPresets.includes(preset.id) ? "whole" : chromeSettings && partialOn(preset.id) ? "partial" : "off";
+  }
+  const customHosts = new Map<string, string[]>();
+  for (const host of synced?.sites ?? []) {
+    const base = host.replace(/^www\./, "");
+    customHosts.set(base, [...(customHosts.get(base) ?? []), host]);
+  }
+  for (const [base, hosts] of customHosts) {
+    rows.push(siteRow(base, hosts));
+    onDisk[`site:${base}`] = "whole";
   }
 
+  const firstRun = kind === "init" && !synced && feedIds.length === 0 && !list?.found;
+  let values: Record<string, Mode> = firstRun
+    ? Object.fromEntries(PRESETS.map((preset) => [preset.id, preset.recommended ? "whole" : "off"]))
+    : { ...onDisk };
   if (kind === "init") {
     io.stdout(
       `${s.bold("focus")} blocks distracting sites while it's on. Choose what to block; change it any time with \`focus config\`.\n` +
@@ -688,67 +703,119 @@ async function configure(kind: "config" | "init", hostsPath: string, passthrough
         "\n",
     );
   }
-  const chosen = await io.choose(kind === "init" ? "What should focus block?" : "What should focus block? Space toggles, Enter saves.", groups, initial);
-  if (chosen === null) {
-    io.stdout("Cancelled; nothing was changed.\n");
+  const header = synced ? `focus is ${synced.state}` : kind === "config" ? "focus isn't set up yet" : undefined;
+
+  // The list, coming back to it after each site added.
+  const added: string[] = [];
+  let focus: string | undefined;
+  for (;;) {
+    const choice = await io.chooseSites(rows, values, { message: "What should focus block?", header, focus });
+    if (choice === null) {
+      io.stdout("Cancelled; nothing was changed.\n");
+      return 0;
+    }
+    values = choice.values;
+    if (!choice.add) break;
+    focus = ADD_ROW;
+    const answer = io.askText ? await io.askText("Which site? A hostname, like example.com.", "example.com") : null;
+    if (answer === null || answer.trim() === "") continue;
+    let host: string;
+    try {
+      host = normalizeHostname(answer);
+    } catch (error) {
+      io.stdout(`${(error as Error).message}\n`);
+      continue;
+    }
+    const base = host.replace(/^www\./, "");
+    const owner = PRESETS.find((preset) => preset.hosts.includes(host));
+    if (owner) {
+      io.stdout(`${host} is part of ${owner.name}; set it on that row.\n`);
+      focus = owner.id;
+      continue;
+    }
+    focus = `site:${base}`;
+    if (!rows.some((row) => row.id === focus)) {
+      rows.push(siteRow(base, [host]));
+      added.push(host);
+    }
+    values = { ...values, [focus]: "whole" };
+  }
+
+  // What to change, row by row; a row left as it was keeps everything on disk as it is.
+  const changed = rows.filter((row) => values[row.id] !== (onDisk[row.id] ?? "off"));
+  if (changed.length === 0) {
+    io.stdout("No changes.\n");
     return 0;
   }
-  const nextPresets = PRESETS.map((preset) => preset.id).filter((id) => chosen.includes(id));
-  const nextFeeds = FEED_SITES.map((site) => site.id).filter((id) => chosen.includes(`feed:${id}`));
-  const nextReddit = chosen.includes(REDDIT_CHOICE);
-  const done = (text: string) => io.stdout(`${s.green("✓")} ${text}\n`);
-  const dry = dryRun ? " (dry run: not saved)" : "";
+  const changedIds = new Set(changed.map((row) => row.id));
+  const nextPresets = PRESETS.map((preset) => preset.id).filter((id) => (changedIds.has(id) ? values[id] === "whole" : currentPresets.includes(id)));
+  const nextFeeds = FEED_SITES.filter((site) =>
+    changedIds.has(site.preset) ? values[site.preset] === "partial" : feedIds.includes(site.id),
+  ).map((site) => site.id);
+  const nextReddit = changedIds.has("reddit") ? values.reddit === "partial" : redditOn;
+  const removedHosts = [...customHosts].filter(([base]) => values[`site:${base}`] === "off").flatMap(([, hosts]) => hosts);
+  const addedHosts = added.filter((host) => values[`site:${host.replace(/^www\./, "")}`] === "whole");
 
-  // The Chrome settings: your files, written as you.
-  if (chromeSettings && list) {
-    if (nextFeeds.join() !== feedIds.join()) {
-      if (!dryRun) await writeFeeds(io.chrome.feedsPath, nextFeeds);
-      for (const id of nextFeeds.filter((id) => !feedIds.includes(id))) {
-        const site = findFeedSite(id)!;
-        done(`${site.name}: ${site.mode}, in Chrome ${s.dim(`(${site.keeps})`)}${dry}`);
-      }
-      for (const id of feedIds.filter((id) => !nextFeeds.includes(id))) done(`${findFeedSite(id)!.name}: no longer restricted in Chrome${dry}`);
+  // Ask what's still needed before writing anything.
+  let allow = list?.allow ?? [];
+  if (nextReddit && !redditOn && allow.length === 0) {
+    const answer = io.askText ? await io.askText("Which subreddits should load? Separate them with spaces.", "rust AskHistorians") : null;
+    if (answer === null) {
+      io.stdout("Cancelled; nothing was changed.\n");
+      return 0;
     }
-    if (nextReddit !== redditOn) {
-      let allow = list.allow;
-      if (nextReddit && allow.length === 0) {
-        const answer = io.askText
-          ? await io.askText("Which subreddits should load? Separate them with spaces.", "rust AskHistorians")
-          : null;
-        if (answer === null) {
-          io.stdout("Cancelled; nothing else was changed.\n");
-          return 0;
-        }
-        allow = answer.trim() === "" ? [] : parseSubreddits(answer.trim().split(/[\s,]+/), "config");
-      }
-      if (!dryRun) await writeAllowlist(io.chrome.allowlistPath, allow, nextReddit);
-      done(
-        nextReddit
-          ? `Reddit: only ${allow.length > 0 ? allow.map((name) => `r/${name}`).join(", ") : "the subreddits you allow (none yet; add them with `focus reddit allow`)"}, in Chrome${dry}`
-          : `Reddit: no longer restricted in Chrome; your list is kept${dry}`,
-      );
-    }
-    // Both checked: the hosts file wins, so say the finer setting waits.
-    const shadowed = [
-      ...nextFeeds.filter((id) => nextPresets.includes(findFeedSite(id)!.preset)).map((id) => findFeedSite(id)!.name),
-      ...(nextReddit && nextPresets.includes("reddit") ? ["Reddit"] : []),
-    ];
-    if (shadowed.length > 0) {
-      io.stdout(`  ${s.dim(`${shadowed.join(" and ")}: the whole site is blocked, so the Chrome setting does nothing until you uncheck the whole site.`)}\n`);
-    }
+    allow = answer.trim() === "" ? [] : parseSubreddits(answer.trim().split(/[\s,]+/), "config");
   }
 
-  // The hosts file: through `init` (exactly these presets) or, for none at all, `remove`.
-  let code = 0;
+  // The hosts file first. Its section also holds the on/off state for Chrome settings alone.
+  const usesChromeAfter = chromeSettings && (nextFeeds.length > 0 || nextReddit);
+  const steps: string[][] = [];
   if (nextPresets.join() !== currentPresets.join()) {
-    const change = nextPresets.length > 0 ? ["init", ...nextPresets] : ["remove", ...currentPresets];
-    code = await runCommand([...change, ...passthrough], io);
-  } else if (nextFeeds.join() === feedIds.join() && nextReddit === redditOn) {
-    io.stdout("No changes.\n");
+    steps.push(nextPresets.length > 0 ? ["init", ...nextPresets] : ["remove", "--preset", ...currentPresets]);
   }
+  if (removedHosts.length > 0) steps.push(["remove", "--exact", ...removedHosts]);
+  if (addedHosts.length > 0) steps.push(["add", ...addedHosts]);
+  if (steps.length === 0 && usesChromeAfter && !synced) steps.push(["on"]);
+  if (steps.length === 0 && !usesChromeAfter && synced && isEmpty(synced)) steps.push(["sync"]);
+  const keep = chromeSettings ? [usesChromeAfter ? "--keep-empty" : "--no-keep-empty"] : [];
+  for (const [index, step] of steps.entries()) {
+    let code: number;
+    try {
+      code = await runCommand([...step, ...keep, "--quiet", ...passthrough], io);
+    } catch (error) {
+      if (error instanceof UsageError) throw error;
+      io.stderr(`focus: ${describeError(error)}\n`);
+      code = 1;
+    }
+    if (code !== 0) {
+      io.stderr(
+        index === 0
+          ? "focus: the hosts file wasn't changed, so nothing else was either\n"
+          : "focus: only part of the change reached the hosts file, and the Chrome settings weren't changed; run `focus config` again\n",
+      );
+      return code;
+    }
+  }
+
+  // Then the Chrome settings.
+  if (chromeSettings && list && !dryRun) {
+    if (nextFeeds.join() !== feedIds.join()) await writeFeeds(io.chrome.feedsPath, nextFeeds);
+    if (nextReddit !== redditOn || allow !== list.allow) {
+      if (nextReddit || list.found) await writeAllowlist(io.chrome.allowlistPath, allow, nextReddit);
+    }
+  }
+
+  for (const row of changed) {
+    const option = row.modes.find((candidate) => candidate.mode === values[row.id]);
+    const where = values[row.id] === "partial" ? s.dim(" (in Chrome)") : "";
+    const what = row.id.startsWith("site:") && values[row.id] === "off" ? "removed" : option?.label ?? values[row.id];
+    io.stdout(`${s.green("✓")} ${row.name}: ${what}${where}${dryRun ? s.dim(" (dry run: not saved)") : ""}\n`);
+  }
+  if (synced?.state === "off") io.stdout(s.dim("focus is off; these apply when you turn it on with `focus`.\n"));
 
   // The Chrome options need the extension.
-  if (code === 0 && chromeSettings && !dryRun && (nextFeeds.length > 0 || nextReddit)) {
+  let code = 0;
+  if (usesChromeAfter && !dryRun) {
     const installed = await isDirectory(io.chrome.extensionDir);
     const loaded = installed ? await chromeProfiles(io) : [];
     if (!installed || loaded?.length === 0) {
@@ -771,6 +838,49 @@ async function configure(kind: "config" | "init", hostsPath: string, passthrough
     );
   }
   return code;
+}
+
+function presetRow(preset: Preset, chromeSettings: boolean, subreddits: string[], both: boolean): SiteRow {
+  const site = findFeedSite(preset.id);
+  const partial =
+    !chromeSettings
+      ? null
+      : site
+        ? { mode: "partial" as const, label: site.mode, detail: site.detail }
+        : preset.id === "reddit"
+          ? {
+              mode: "partial" as const,
+              label: "chosen subreddits",
+              detail:
+                subreddits.length > 0
+                  ? `Only ${subreddits.map((name) => `r/${name}`).join(", ")} load, in Chrome.`
+                  : "In Chrome, every subreddit but the ones you choose is blocked.",
+            }
+          : null;
+  const shown = preset.hosts.filter((host) => !host.startsWith("www."));
+  return {
+    id: preset.id,
+    name: preset.name,
+    modes: [
+      { mode: "off", label: "off", detail: "Not blocked." },
+      { mode: "whole", label: "whole site", detail: `Blocked everywhere, through /etc/hosts.${preset.note ? ` (${preset.note})` : ""}` },
+      ...(partial ? [partial] : []),
+    ],
+    hosts: shown.slice(0, 4).join(" · ") + (shown.length > 4 ? " …" : ""),
+    note: both ? "Its Chrome option is set too; the whole site wins." : undefined,
+  };
+}
+
+function siteRow(base: string, hosts: string[]): SiteRow {
+  return {
+    id: `site:${base}`,
+    name: base,
+    modes: [
+      { mode: "off", label: "off", detail: "Not blocked; leaving it off removes it from the list." },
+      { mode: "whole", label: "blocked", detail: "Blocked everywhere, through /etc/hosts." },
+    ],
+    hosts: hosts.join(" · "),
+  };
 }
 
 const GUIDE_URL = "https://github.com/brentvatne/focus/blob/main/docs/guide.md#finer-blocking-in-chrome";
@@ -914,6 +1024,19 @@ function tildify(path: string, home: string | undefined): string {
   return home && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
 }
 
+/**
+ * Whether any Chrome setting is on: then focus keeps its section in the hosts file even with
+ * no hosts in it, for the on/off state. Unreadable settings count as on, so state isn't lost.
+ */
+async function usesChrome(io: Io): Promise<boolean> {
+  try {
+    const list = await readAllowlist(io.chrome.allowlistPath);
+    return (list.found && list.enabled) || (await readFeeds(io.chrome.feedsPath)).length > 0;
+  } catch {
+    return true;
+  }
+}
+
 /** Where Chrome has the installed extension loaded; null if Chrome's profiles can't be read. */
 async function chromeProfiles(io: Io): Promise<LoadedExtension[] | null> {
   const id = await readExtensionId(io.chrome.extensionDir).catch(() => null);
@@ -1009,7 +1132,7 @@ function planChange(
   command: string | undefined,
   args: string[],
   current: FocusSection | null,
-  options: { exact: boolean; preset: boolean },
+  options: { exact: boolean; preset: boolean; keepEmpty: boolean },
   io: Io,
 ): FocusSection | null {
   const enabled = current?.presets.map((group) => group.id) ?? [];
@@ -1061,13 +1184,16 @@ function planChange(
     case "off": {
       if (args.length > 0) throw new UsageError(`${command} takes no arguments`);
       if (!current) {
+        // Only Chrome settings: turning on creates the section that holds the state.
+        if (options.keepEmpty) return command === "on" ? { state: "on", presets: [], sites: [] } : null;
         if (command === "on") io.stderr("focus: nothing is listed yet; run `focus init` or `focus add <host>`\n");
         return null;
       }
       return { ...current, state: command };
     }
     case undefined:
-      return current && { ...current, state: current.state === "on" ? "off" : "on" };
+      if (!current) return options.keepEmpty ? { state: "on", presets: [], sites: [] } : null;
+      return { ...current, state: current.state === "on" ? "off" : "on" };
     case "sync":
       if (args.length > 0) throw new UsageError("sync takes no arguments");
       return current;
@@ -1082,7 +1208,7 @@ function offPresetsOwning(hosts: string[], section: FocusSection | null): Preset
   return PRESETS.filter((preset) => !enabled.has(preset.id) && hosts.some((host) => preset.hosts.includes(host)));
 }
 
-/** The presets `init` sets without a checklist: the named ones, or with --yes the current (or recommended) ones. */
+/** The presets `init` sets without the list: the named ones, or with --yes the current (or recommended) ones. */
 function choosePresets(args: string[], yes: boolean, current: FocusSection | null): string[] {
   if (args.length > 0) return parsePresetIds(args, "init");
   if (!yes) {
@@ -1154,9 +1280,8 @@ function allHosts(section: FocusSection): Set<string> {
 }
 
 function formatStatus(path: string, section: FocusSection | null): string {
-  if (!section || isEmpty(section)) {
-    return `Hosts file: ${path}\nBlocking:   off (nothing listed)\n`;
-  }
+  if (!section) return `Hosts file: ${path}\nBlocking:   off (nothing listed)\n`;
+  if (isEmpty(section)) return `Hosts file: ${path}\nBlocking:   ${section.state} (in Chrome only; nothing in the hosts file)\n`;
   const lines = [`Hosts file: ${path}`, `Blocking:   ${section.state}`];
   if (section.presets.length > 0) {
     lines.push(`Presets:    ${section.presets.map((group) => findPreset(group.id)?.name ?? group.id).join(", ")}`);
@@ -1341,7 +1466,7 @@ if (import.meta.main) {
       };
     },
     flushDns: flushMacDnsCache,
-    choose: process.stdin.isTTY && process.stdout.isTTY ? chooseOptions : undefined,
+    chooseSites: process.stdin.isTTY && process.stdout.isTTY ? chooseSites : undefined,
     askText: process.stdin.isTTY && process.stdout.isTTY ? askText : undefined,
     upgrade: (dryRun, progress) =>
       upgrade(VERSION, dryRun, {
