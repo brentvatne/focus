@@ -118,6 +118,8 @@ async function focusWith(overrides: Partial<Io>, ...argv: string[]) {
         throw new Error("tests must stub chrome.copyToClipboard; it would change the real clipboard");
       },
     },
+    statsPath: join(dir, "stats.jsonl"),
+    now: () => Date.now(),
     nativeMessaging: {
       input: () => {
         throw new Error("tests must stub nativeMessaging.input");
@@ -1666,6 +1668,64 @@ describe("reddit", () => {
     const asRoot = await focusWith({ isRoot: true, systemHostsFile: hostsFile, env: { FOCUS_CONFIG: configFile } }, "status");
     expect(asRoot.code).toBe(0);
     expect(asRoot.stdout).not.toContain("Subreddits");
+  });
+});
+
+describe("stats", () => {
+  const statsFile = () => join(dir, "stats.jsonl");
+  const events = async () => (await Bun.file(statsFile()).exists() ? (await Bun.file(statsFile()).text()).trim().split("\n").map((line) => JSON.parse(line)) : []);
+  /** As you, on the real hosts file: sudo is a stand-in that runs the same command as root. */
+  const asYou = (now: number, ...argv: string[]) =>
+    focusWith(
+      {
+        systemHostsFile: hostsFile,
+        now: () => now,
+        elevate: async (args) => (await focusWith({ isRoot: true, systemHostsFile: hostsFile, env: { FOCUS_CONFIG: configFile } }, ...args)).code,
+      },
+      ...argv,
+    );
+
+  test("records each time blocking is turned on or off, by the process that asked sudo for it", async () => {
+    await asYou(Date.parse("2026-10-16T09:00:00Z"), "add", "a.com");
+    await asYou(Date.parse("2026-10-16T10:00:00Z"), "off");
+    await asYou(Date.parse("2026-10-16T10:05:00Z"), "status");
+    await asYou(Date.parse("2026-10-16T10:30:00Z"));
+    expect(await events()).toEqual([
+      { at: "2026-10-16T09:00:00.000Z", event: "on" },
+      { at: "2026-10-16T10:00:00.000Z", event: "off" },
+      { at: "2026-10-16T10:30:00.000Z", event: "on" },
+    ]);
+  });
+
+  test("a change made elsewhere is recorded as noticed when focus next runs", async () => {
+    await asYou(Date.parse("2026-10-16T09:00:00Z"), "add", "a.com");
+    // As if `sudo focus off` ran: root never writes stats.
+    await focusWith({ isRoot: true, systemHostsFile: hostsFile, env: { FOCUS_CONFIG: configFile } }, "off");
+    expect(await events()).toHaveLength(1);
+    await asYou(Date.parse("2026-10-16T11:00:00Z"), "status");
+    expect((await events())[1]).toEqual({ at: "2026-10-16T11:00:00.000Z", event: "off", seen: true });
+  });
+
+  test("other hosts files, dry runs and failed changes aren't recorded", async () => {
+    await focus("add", "a.com");
+    expect(await events()).toEqual([]);
+    await asYou(Date.parse("2026-10-16T09:00:00Z"), "add", "b.com", "--dry-run");
+    const failed = await focusWith({ systemHostsFile: hostsFile, elevate: async () => 1 }, "off");
+    expect(failed.code).toBe(1);
+    // Only the first note that focus is on, which it already was.
+    expect(await events()).toEqual([{ at: "2026-10-16T09:00:00.000Z", event: "on", seen: true }]);
+  });
+
+  test("focus stats shows the days, and --days changes how many", async () => {
+    await asYou(Date.parse("2026-10-16T09:00:00Z"), "add", "a.com");
+    const result = await focusWith({ now: () => Date.parse("2026-10-16T10:00:00Z") }, "stats", "--days", "2");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("focus is on, for 1h 00m");
+    expect(result.stdout.split("\n").filter((line) => /^(Today|Yesterday|Total) /.test(line))).toHaveLength(3);
+    expect(result.stdout).toContain("`focus chrome install`");
+    expect((await focus("stats", "--days", "0")).code).toBe(2);
+    expect((await focus("status", "--days", "3")).stderr).toContain("--days only works with stats");
+    expect((await focusWith({ isRoot: true, systemHostsFile: hostsFile }, "stats")).stderr).toContain("as yourself");
   });
 });
 

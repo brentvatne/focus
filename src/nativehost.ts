@@ -1,12 +1,14 @@
 // focus as the Chrome extension's native-messaging host. Chrome starts the binary with
 // the extension's origin as its argument, sends one message on stdin and waits for one
-// reply on stdout. The host only reads: the hosts file's state and the subreddit
-// allowlist. Its one write is refreshing the extension's own folder after an upgrade.
+// reply on stdout. The host reads the hosts file's state, the subreddit allowlist and
+// the feeds. It writes only two things: the extension's own folder after an upgrade, and
+// the blocked pages the extension reports, appended to the stats file.
 import { PROTOCOL } from "../extension/rules.js";
 import { isDirectory, writeExtension } from "./chrome.ts";
 import { type FocusSection, HostsFormatError, readSection } from "./hosts.ts";
 import { readHostsFile } from "./hostsfile.ts";
 import { FEED_SITES, readFeeds } from "./feeds.ts";
+import { type BlockedEvent, appendEvents } from "./stats.ts";
 import { readAllowlist } from "./subreddits.ts";
 
 /** Chrome's limit for a message from the host; requests are far smaller. */
@@ -56,6 +58,8 @@ export interface NativeHostDeps {
   feedsPath: string;
   extensionSource: string;
   extensionDir: string;
+  statsPath: string;
+  now(): number;
   version: string;
   log(text: string): void;
 }
@@ -73,6 +77,10 @@ export interface StatusReply {
   redditBlockedByHosts: boolean;
   /** focus rewrote the extension's folder for this version; the extension should reload. */
   reload: boolean;
+  /** While on, every host the hosts file blocks, so the extension can count tries to open them. */
+  blockedHosts: string[];
+  /** How many of the request's `record` entries were handled; the extension forgets that many. Absent if they couldn't be saved. */
+  recorded?: number;
   /** The hosts file couldn't be read; the extension keeps its last rules. */
   error?: string;
   /** The allowlist couldn't be read, so `allow` is empty: nothing is allowed while on, and off still means off. */
@@ -94,6 +102,7 @@ export async function respond(request: unknown, deps: NativeHostDeps): Promise<S
     feeds: [],
     redditBlockedByHosts: false,
     reload: false,
+    blockedHosts: [],
   };
 
   try {
@@ -101,6 +110,7 @@ export async function respond(request: unknown, deps: NativeHostDeps): Promise<S
     // An empty section is kept for Chrome settings alone, so its state counts too.
     reply.state = section ? section.state : "none";
     reply.redditBlockedByHosts = section !== null && blocksReddit(section);
+    if (section?.state === "on") reply.blockedHosts = [...section.presets.flatMap((group) => group.hosts), ...section.sites];
   } catch (error) {
     reply.state = "error";
     reply.error =
@@ -124,6 +134,17 @@ export async function respond(request: unknown, deps: NativeHostDeps): Promise<S
     reply.feedsError = messageOf(error);
   }
 
+  const { record } = request as { record?: unknown };
+  if (Array.isArray(record)) {
+    try {
+      await appendEvents(deps.statsPath, blockedEvents(record, deps.now()));
+      // Entries that weren't valid count as handled too, so the extension doesn't keep sending them.
+      reply.recorded = record.length;
+    } catch (error) {
+      deps.log(`focus: couldn't save stats: ${messageOf(error)}\n`);
+    }
+  }
+
   // Only a folder focus wrote reports a version_name, so a development copy is never rewritten.
   const { extensionVersion } = request as { extensionVersion?: unknown };
   if (typeof extensionVersion === "string" && extensionVersion !== deps.version && (await isDirectory(deps.extensionDir))) {
@@ -135,6 +156,26 @@ export async function respond(request: unknown, deps: NativeHostDeps): Promise<S
     }
   }
   return reply;
+}
+
+/** At most this many entries per request; the extension sends what it has saved up, and keeps at most 1,000. */
+export const MAX_RECORDED = 1000;
+const HOST_PATTERN = /^[a-z0-9.-]{1,253}$/;
+const SITE_PATTERN = /^[a-z]{1,32}$/;
+
+/** The extension's blocked pages as stats events: valid entries only, timed between a year ago and now. */
+export function blockedEvents(record: unknown[], now: number): BlockedEvent[] {
+  const events: BlockedEvent[] = [];
+  for (const entry of record.slice(0, MAX_RECORDED)) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const { at, host, site, mode } = entry as Record<string, unknown>;
+    if (typeof at !== "number" || !Number.isFinite(at) || at > now + 60_000 || at < now - 366 * 24 * 60 * 60 * 1000) continue;
+    if (typeof host !== "string" || !HOST_PATTERN.test(host)) continue;
+    if (mode !== "whole" && mode !== "partial") continue;
+    if (site !== undefined && (typeof site !== "string" || !SITE_PATTERN.test(site))) continue;
+    events.push({ at: new Date(at).toISOString(), event: "blocked", host, ...(site ? { site } : {}), mode });
+  }
+  return events;
 }
 
 function messageOf(error: unknown): string {

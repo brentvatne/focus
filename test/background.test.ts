@@ -41,6 +41,8 @@ function fakeChrome() {
     navigations: [] as { tabId: number; url: string }[],
     reloads: [] as number[],
     nativeCalls: 0,
+    /** Every message sent to the native host. */
+    requests: [] as Record<string, unknown>[],
   };
   const events = {
     onInstalled: new Event(),
@@ -58,8 +60,9 @@ function fakeChrome() {
       getManifest: () => ({ version: "0.1.3", version_name: "0.1.3" }),
       getURL: (path: string) => `chrome-extension://${ID}/${path}`,
       reload: () => {},
-      sendNativeMessage: async () => {
+      sendNativeMessage: async (_host: string, message: Record<string, unknown>) => {
         state.nativeCalls++;
+        state.requests.push(structuredClone(message));
         return state.reply();
       },
       onInstalled: events.onInstalled,
@@ -483,5 +486,91 @@ describe("post pages", () => {
     await fake.events.onRemoved.fire(1);
     await settle();
     expect(fake.state.session.reports).toEqual({});
+  });
+});
+
+describe("stats", () => {
+  /** Answers like a focus that saves stats: it handles every entry sent. */
+  const saving = (extra: Reply = {}) => () => {
+    const last = fake.state.requests.at(-1)!;
+    const record = last.record as unknown[] | undefined;
+    return status("on", [], { reddit: false, feeds: ["youtube"], ...(record ? { recorded: record.length } : {}), ...extra });
+  };
+  const sent = () => fake.state.requests.flatMap((request) => (request.record as Record<string, unknown>[] | undefined) ?? []);
+
+  test("a page the rules blocked is counted and sent to focus, which then forgets it", async () => {
+    fake.state.reply = saving();
+    await startWorker();
+    openTab(1, "https://www.youtube.com/shorts/abc");
+    await fake.events.onErrorOccurred.fire({ frameId: 0, tabId: 1, url: "https://www.youtube.com/shorts/abc", error: "net::ERR_BLOCKED_BY_CLIENT" });
+    await settle();
+    expect(sent()).toEqual([{ at: expect.any(Number), host: "www.youtube.com", site: "youtube", mode: "partial" }]);
+    expect(fake.state.storage.pendingStats).toEqual([]);
+  });
+
+  test("a focus from before stats doesn't say it saved them, so they wait", async () => {
+    fake.state.reply = () => status("on", [], { reddit: false, feeds: ["youtube"] });
+    await startWorker();
+    openTab(1, "https://www.youtube.com/");
+    await fake.events.onErrorOccurred.fire({ frameId: 0, tabId: 1, url: "https://www.youtube.com/", error: "net::ERR_BLOCKED_BY_CLIENT" });
+    await settle();
+    expect(fake.state.storage.pendingStats).toEqual([{ at: expect.any(Number), host: "www.youtube.com", site: "youtube", mode: "partial" }]);
+    // Sent again with the next request, to a focus that saves them.
+    fake.state.reply = saving();
+    openTab(2, "https://www.youtube.com/watch?v=abc");
+    await fake.events.onAlarm.fire({});
+    await settle();
+    expect(fake.state.storage.pendingStats).toEqual([]);
+  });
+
+  test("one try counts once, even if Chrome reports it twice", async () => {
+    fake.state.reply = saving();
+    await startWorker();
+    openTab(1, "https://www.youtube.com/");
+    for (let i = 0; i < 2; i++) {
+      await fake.events.onErrorOccurred.fire({ frameId: 0, tabId: 1, url: "https://www.youtube.com/", error: "net::ERR_BLOCKED_BY_CLIENT" });
+      await settle();
+    }
+    expect(sent()).toHaveLength(1);
+  });
+
+  test("going to a blocked page by a client-side route counts; focus turning on under an open page doesn't", async () => {
+    fake.state.reply = () => status("off", [], { reddit: false, feeds: ["youtube"] });
+    await startWorker();
+    openTab(1, "https://www.youtube.com/");
+    fake.state.reply = saving();
+    await fake.events.onAlarm.fire({});
+    await settle();
+    expect(fake.state.navigations).toHaveLength(1); // swept to the blocked page
+    expect(sent()).toEqual([]);
+    openTab(2, "https://www.youtube.com/watch?v=abc");
+    await route(2, "https://www.youtube.com/feed/trending");
+    await settle();
+    expect(sent()).toEqual([expect.objectContaining({ host: "www.youtube.com", mode: "partial" })]);
+  });
+
+  test("a site the hosts file blocks counts when it fails to load, but not when cancelled or loaded ahead", async () => {
+    fake.state.reply = saving({ blockedHosts: ["tiktok.com", "www.tiktok.com"] });
+    await startWorker();
+    const fail = async (tabId: number, url: string, error: string, extra = {}) => {
+      openTab(tabId, url);
+      await fake.events.onErrorOccurred.fire({ frameId: 0, tabId, url, error, ...extra });
+      await settle();
+    };
+    await fail(1, "https://www.tiktok.com/foryou", "net::ERR_ADDRESS_INVALID");
+    await fail(2, "https://www.tiktok.com/", "net::ERR_ABORTED");
+    await fail(3, "https://www.tiktok.com/", "net::ERR_ADDRESS_INVALID", { documentLifecycle: "prerender" });
+    await fail(4, "https://example.com/", "net::ERR_NAME_NOT_RESOLVED");
+    expect(sent()).toEqual([{ at: expect.any(Number), host: "www.tiktok.com", mode: "whole" }]);
+  });
+
+  test("a site the hosts file used to block doesn't count once focus is off", async () => {
+    fake.state.reply = saving({ blockedHosts: ["tiktok.com"] });
+    await startWorker();
+    fake.state.reply = () => status("off", [], { blockedHosts: [] });
+    openTab(1, "https://tiktok.com/");
+    await fake.events.onErrorOccurred.fire({ frameId: 0, tabId: 1, url: "https://tiktok.com/", error: "net::ERR_CONNECTION_RESET" });
+    await settle();
+    expect(fake.state.storage.pendingStats ?? []).toEqual([]);
   });
 });

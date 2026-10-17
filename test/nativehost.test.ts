@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROTOCOL } from "../extension/rules.js";
 import { EXTENSION_FILES, chromeVersion, extensionId, readExtensionId, writeExtension } from "../src/chrome.ts";
+import { readEvents } from "../src/stats.ts";
 import { MAX_MESSAGE_BYTES, type StatusReply, encodeMessage, readMessage, respond } from "../src/nativehost.ts";
 
+const NOW = Date.parse("2026-10-16T17:00:00Z");
 const EXTENSION_SOURCE = join(import.meta.dir, "..", "extension");
 
 async function* chunks(...parts: Uint8Array[]) {
@@ -49,6 +51,8 @@ describe("respond", () => {
     feedsPath: join(dir, "feeds.json"),
     extensionSource: EXTENSION_SOURCE,
     extensionDir: join(dir, "chrome-extension"),
+    statsPath: join(dir, "stats.jsonl"),
+    now: () => NOW,
     version: "9.9.9",
     log: () => {},
   });
@@ -68,11 +72,11 @@ describe("respond", () => {
   });
 
   test.each([
-    ["on", section("on", "x.com"), false],
-    ["off", section("off", "x.com"), false],
-    ["on", section("on", "x.com", "reddit.com"), true],
-    ["none", "127.0.0.1 localhost\n", false],
-  ])("reports %s", async (state, content, redditBlockedByHosts) => {
+    ["on", section("on", "x.com"), false, ["x.com"]],
+    ["off", section("off", "x.com"), false, []],
+    ["on", section("on", "x.com", "reddit.com"), true, ["x.com", "reddit.com"]],
+    ["none", "127.0.0.1 localhost\n", false, []],
+  ])("reports %s", async (state, content, redditBlockedByHosts, blockedHosts) => {
     await Bun.write(hosts, content);
     expect(await respond({ type: "status" }, deps())).toEqual({
       protocol: PROTOCOL,
@@ -83,6 +87,7 @@ describe("respond", () => {
       feeds: [],
       redditBlockedByHosts,
       reload: false,
+      blockedHosts,
     } as never);
   });
 
@@ -121,6 +126,38 @@ describe("respond", () => {
       expect(reply).toMatchObject({ state, allow: [], allowlistError: expect.stringMatching(/feed/) });
       expect(reply).not.toHaveProperty("error");
     }
+  });
+
+  test("saves the blocked pages the extension reports, and says how many it handled", async () => {
+    await Bun.write(hosts, section("on", "x.com"));
+    const record = [
+      { at: NOW - 60_000, host: "www.youtube.com", site: "youtube", mode: "partial" },
+      { at: NOW - 30_000, host: "x.com", mode: "whole" },
+      // Dropped, but still counted as handled so the extension stops sending them.
+      { at: NOW + 3_600_000, host: "x.com", mode: "whole" },
+      { at: NOW, host: "../etc/passwd", mode: "whole" },
+      { at: NOW, host: "x.com", mode: "sideways" },
+      "nonsense",
+    ];
+    const reply = (await respond({ type: "status", record }, deps())) as StatusReply;
+    expect(reply.recorded).toBe(6);
+    expect(await readEvents(join(dir, "stats.jsonl"))).toEqual([
+      { at: new Date(NOW - 60_000).toISOString(), event: "blocked", host: "www.youtube.com", site: "youtube", mode: "partial" },
+      { at: new Date(NOW - 30_000).toISOString(), event: "blocked", host: "x.com", mode: "whole" },
+    ]);
+  });
+
+  test("without a record, or when it can't be saved, nothing counts as recorded", async () => {
+    await Bun.write(hosts, section("on", "x.com"));
+    expect(await respond({ type: "status" }, deps())).not.toHaveProperty("recorded");
+    const record = [{ at: NOW, host: "x.com", mode: "whole" }];
+    let logged = "";
+    // A directory where the file should be, so the append fails.
+    const blocked = { ...deps(), statsPath: dir, log: (text: string) => void (logged += text) };
+    const reply = await respond({ type: "status", record }, blocked);
+    expect(reply).not.toHaveProperty("recorded");
+    expect(reply).toMatchObject({ state: "on" });
+    expect(logged).toContain("couldn't save stats");
   });
 
   test("refuses anything but a status request", async () => {

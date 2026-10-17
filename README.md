@@ -24,6 +24,7 @@ focus off                # take a break; `focus on` to resume
 focus config             # change what's blocked: the same list as init
 focus add example.com    # block anything else (`focus remove` unblocks it)
 focus status
+focus stats              # how long focus was on, and how often Chrome tried a blocked site
 focus upgrade
 ```
 

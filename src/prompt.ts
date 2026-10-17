@@ -10,9 +10,9 @@ export interface SiteRow {
   name: string;
   /** The modes this row offers, in order, each with what it means. */
   modes: { mode: Mode; label: string; detail: string }[];
-  /** A dim line under the focused row: the hostnames it covers. */
+  /** A dim line about the focused row: the hostnames it covers. */
   hosts: string;
-  /** Shown under the focused row too, for something worth knowing about its current state. */
+  /** Shown about the focused row too, for something worth knowing about its current state. */
   note?: string;
 }
 
@@ -36,8 +36,8 @@ const ADD = "\0add";
 
 /**
  * One row per site, each set to one of its modes: ←/→ (or 1, 2, 3) picks the mode of the
- * focused row, which also shows what that mode does and the hostnames involved. The last
- * row adds a site. Screen readers get one question per site instead (ACCESSIBLE=1).
+ * focused row. Below the list, a fixed area says what that mode does and the hostnames
+ * involved. The last row adds a site. Screen readers get one question per site instead (ACCESSIBLE=1).
  */
 export async function chooseSites(rows: SiteRow[], initial: Record<string, Mode>, options: SitesOptions): Promise<SitesChoice | null> {
   if (isAccessible()) return chooseSitesOneByOne(rows, initial, options);
@@ -103,40 +103,40 @@ export function renderSites(
     const summary = state === "cancel" ? gray("Cancelled") : gray(cursor === ADD ? "Adding a site…" : "Done");
     return `${gray("◇")}  ${options.message}\n${bar}  ${summary}`;
   }
-  // Narrow terminals show every mode only on the focused row.
+  // Narrow terminals show each row's current mode, and the focused row's choices below.
   const compact = columns < 76;
   // Names line up in a column as wide as the longest (your own sites can be long), within reason.
   const width = Math.min(Math.max(11, ...rows.map((row) => row.name.length)), 24) + 2;
   const lines = [`${cyan("◆")}  ${options.message}`];
   if (options.header) lines.push(`${bar}  ${gray(options.header)}`);
   lines.push(bar);
+  // Every row is drawn the same whether or not it has the cursor, so moving never shifts anything.
+  const modesOf = (row: SiteRow, value: Mode) =>
+    row.modes.map((option) => (option.mode === value ? green(`● ${option.label}`) : gray(`○ ${option.label}`))).join("  ");
   for (const row of rows) {
     const focused = row.id === cursor;
     const value = values[row.id] ?? "off";
     const name = row.name.length > width - 2 ? `${row.name.slice(0, width - 3)}…` : row.name;
     const label = (focused ? bold : (text: string) => text)(name.padEnd(width - 2));
-    const segments =
-      compact && !focused
-        ? labelOf(row, value)
-        : row.modes
-            .map((option, index) =>
-              option.mode === value
-                ? green(`● ${option.label}`)
-                : gray(`○ ${focused && row.modes.length > 1 ? `${index + 1} ` : ""}${option.label}`),
-            )
-            .join("  ");
-    lines.push(`${bar} ${focused ? cyan("›") : " "} ${label}  ${segments}`);
-    if (focused) {
-      const detail = row.modes.find((option) => option.mode === value)?.detail ?? "";
-      for (const extra of [detail, row.note, row.hosts]) {
-        if (extra) lines.push(`${bar}   ${" ".repeat(width)}${gray(extra)}`);
-      }
-    }
+    lines.push(`${bar} ${focused ? cyan("›") : " "} ${label}  ${compact ? labelOf(row, value) : modesOf(row, value)}`);
   }
   const adding = cursor === ADD;
   lines.push(`${bar} ${adding ? cyan("›") : " "} ${adding ? bold("+ Add a site…") : gray("+ Add a site…")}`);
-  lines.push(bar, `${cyan("└")}  ${gray(adding ? "Enter: add a site · Esc: cancel" : "↑/↓ site · ←/→ or 1-3 mode · Enter: done · Esc: cancel")}`);
+  // About the focused row, in a fixed number of lines below the list, so the layout stays put.
+  const row = rows.find((candidate) => candidate.id === cursor);
+  const value = row ? (values[row.id] ?? "off") : "off";
+  const about = row
+    ? [...(compact ? [modesOf(row, value)] : []), row.modes.find((option) => option.mode === value)?.detail ?? "", row.hosts, row.note ?? ""]
+    : [...(compact ? [""] : []), "Block any other site by its hostname, such as example.com.", "", ""];
+  lines.push(bar, ...about.map((line, index) => (line ? `${bar}  ${compact && index === 0 ? line : gray(fit(line, columns - 4))}` : bar)));
+  // The note's line, usually empty, doubles as the space before the footer; the height never changes.
+  lines.push(`${cyan("└")}  ${gray(adding ? "Enter: add a site · Esc: cancel" : "↑/↓ site · ←/→ or 1-3 mode · Enter: done · Esc: cancel")}`);
   return lines.join("\n");
+}
+
+/** Cut to `width` characters, so a long line can't wrap and change the frame's height. */
+function fit(text: string, width: number): string {
+  return text.length > width ? `${text.slice(0, Math.max(width - 1, 0))}…` : text;
 }
 
 function labelOf(row: SiteRow, mode: Mode): string {

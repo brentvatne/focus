@@ -75,26 +75,52 @@ test("Esc cancels", async () => {
   expect(result).toBeNull();
 });
 
-test("the focused row shows every mode, what the chosen one does, and its hostnames", () => {
+test("rows look the same with or without the cursor; the focused one is explained below the list", () => {
   const frame = renderSites(ROWS, INITIAL, "x", "active", { message: "What should focus block?", header: "focus is on" }, 100);
   expect(frame).toBe(
     [
       "◆  What should focus block?",
       "│  focus is on",
       "│",
-      "│ › X / Twitter  ○ 1 off  ● whole site  ○ 3 feed only",
-      "│                Blocked everywhere.",
-      "│                x.com · twitter.com",
+      "│ › X / Twitter  ○ off  ● whole site  ○ feed only",
       "│   Facebook     ● off  ○ whole site",
       "│   + Add a site…",
+      "│",
+      "│  Blocked everywhere.",
+      "│  x.com · twitter.com",
       "│",
       "└  ↑/↓ site · ←/→ or 1-3 mode · Enter: done · Esc: cancel",
     ].join("\n"),
   );
 });
 
-test("narrow terminals show only the current mode on rows without the cursor", () => {
+test("moving the cursor changes only the cursor and the area below the list", () => {
+  const options = { message: "m" };
+  const lines = (cursor: string) => renderSites(ROWS, INITIAL, cursor, "active", options, 100).split("\n");
+  const [onX, onFacebook, onAdd] = [lines("x"), lines("facebook"), lines("\0add")];
+  expect(onFacebook.length).toBe(onX.length);
+  expect(onAdd.length).toBe(onX.length);
+  const strip = (line: string) => line.replace("›", " ");
+  expect(onFacebook.slice(0, 5).map(strip)).toEqual(onX.slice(0, 5).map(strip));
+  expect(onFacebook[6]).toBe("│  Not blocked.");
+  expect(onAdd[6]).toContain("example.com");
+});
+
+test("a row with a note takes no more lines than one without", () => {
+  const rows = [ROWS[0]!, { ...ROWS[1]!, note: "Its Chrome option is set too; the whole site wins." }];
+  const height = (cursor: string) => renderSites(rows, INITIAL, cursor, "active", { message: "m" }, 100).split("\n").length;
+  expect(height("facebook")).toBe(height("x"));
+});
+
+test("long lines below the list are cut rather than wrapped", () => {
+  const long = [{ ...ROWS[0]!, hosts: "a.com · ".repeat(30) }];
+  const frame = renderSites(long, INITIAL, "x", "active", { message: "m" }, 80);
+  for (const line of frame.split("\n")) expect(line.length).toBeLessThanOrEqual(80);
+});
+
+test("narrow terminals show only the current mode on each row, and the focused row's choices below", () => {
   const frame = renderSites(ROWS, INITIAL, "x", "active", { message: "m" }, 60);
+  expect(frame).toContain("│ › X / Twitter  whole site\n");
   expect(frame).toContain("│   Facebook     off\n");
-  expect(frame).toContain("○ 1 off  ● whole site  ○ 3 feed only");
+  expect(frame).toContain("│  ○ off  ● whole site  ○ feed only\n");
 });

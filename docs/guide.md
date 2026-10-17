@@ -58,10 +58,11 @@ focus                              # toggle: off if it's on, on if it's off
 focus feeds add youtube            # in Chrome, block only YouTube's feed (see "Finer blocking in Chrome")
 focus reddit allow rust            # in Chrome, block Reddit except this subreddit
 focus sync                         # update presets to this version's hostnames
-focus status                            # read-only
+focus status                       # read-only
+focus stats                        # how long focus was on, and what Chrome tried to open (see "Stats")
 ```
 
-Commands that change `/etc/hosts` need root, so focus re-runs itself through `sudo` and you get a password prompt. To skip the prompt, see [Running without a password](#running-without-a-password). `status`, `--dry-run` and `version` never ask.
+Commands that change `/etc/hosts` need root, so focus re-runs itself through `sudo` and you get a password prompt. To skip the prompt, see [Running without a password](#running-without-a-password). `status`, `stats`, `--dry-run` and `version` never ask.
 
 Add `-n` / `--dry-run` to any command to print a unified diff of the hosts file without writing it:
 
@@ -76,6 +77,7 @@ focus add -n twitter.com
 | `-n`, `--dry-run` | Print the diff and don't write anything |
 | `--exact` / `--no-exact` | Don't (or do) add or remove the `www.` variant. The default comes from the config file, or is `--no-exact`. |
 | `--hosts-file <path>` | Manage a different file. You can also set `FOCUS_HOSTS_FILE`. The default is `/etc/hosts`. |
+| `--days <n>` | `stats` only: how many days to show, today included (default 7, at most 366) |
 | `--flush` / `--no-flush` | Do (or don't) flush the DNS cache after writing. The default comes from the config file, or is `--flush`. |
 
 ## Choosing what to block: `focus init` and `focus config`
@@ -127,6 +129,31 @@ focus add -n twitter.com
 - **One preset is all or nothing.** `focus remove api.x.com` refuses and points you to `focus remove x`. Adding a hostname that a preset already covers is a no-op.
 - **Without a prompt:** `focus init x youtube` sets your presets to exactly the named ones, and `focus init --yes` keeps the current ones (or picks the recommended ones on a fresh install). Use one of these in scripts; `init` with neither, and `config`, stop with an error when there's no terminal.
 - **Upgrading from 0.1.0:** 0.1.0 didn't record presets. The first time a newer version writes the file, any preset whose 0.1.0 hostnames are all present is recorded as that preset; everything else is kept as your own sites.
+
+## Stats
+
+```text
+$ focus stats
+focus is on, for 1h 15m (since 9:00 AM)
+
+               On for   Sessions   Toggled   Blocked
+Today          1h 15m          1         1         6
+Yesterday      7h 25m          2         4        12
+…
+Total         38h 50m         11        21        54
+
+Sessions: average 3h 31m, longest 4h 05m
+
+Blocked most:
+  YouTube        21
+  Reddit         18
+```
+
+- **On for:** how long blocking was on each day. A session that runs past midnight counts toward both days.
+- **Sessions** are counted on the day they start. **Toggled** is how many times focus was turned on or off that day. The average and longest are over sessions that have ended.
+- **Blocked** counts each time Chrome tried to open a page focus blocks: a whole site blocked by the hosts file, or a feed, subreddit or Instagram page blocked by the extension. It needs the Chrome extension (`focus chrome install`), even if you only block whole sites. Other browsers and apps aren't counted. Pages Chrome loads ahead of time while you type, and tabs focus sends away because you just turned it on, don't count.
+- **Where it's kept:** `~/.config/focus/stats.jsonl`, one line per event, written only as you (never as root). Delete it to start over. It holds times, on and off, and the hostnames that were blocked, never full URLs.
+- **What's recorded when:** focus records turning blocking on or off when you run it as yourself (with or without a password prompt). A change made some other way (`sudo focus off`, or editing `/etc/hosts`) is noticed the next time you run focus; such sessions count toward time on, but not toward the average or longest. Stats start when you install a version with them; there's no history from before.
 
 ## Running without a password
 
@@ -283,6 +310,7 @@ Reddit is only restricted once `~/.config/focus/subreddits.json` exists, so inst
 - **Knowing what Chrome did:** focus reads each Chrome profile's `Secure Preferences` (never writes it) to see whether the extension is loaded from its folder and allowed in Incognito.
 - **Opening Chrome's pages:** `chrome://` pages can't be links in a terminal, because Chrome doesn't register that scheme with macOS, and Chrome ignores them as command-line arguments. focus opens them with `open -a "Google Chrome"`, which Chrome does accept.
 - **On or off:** the extension asks focus whether blocking is on and what's set. Chrome starts the focus binary for each question (native messaging), and focus reads `/etc/hosts` and your settings, answers and exits. Nothing keeps running. The extension remembers the last answer, so if focus can't be reached, it keeps the last rules.
+- **Stats:** the extension keeps the pages it saw blocked and sends them with its next question; focus appends them to `~/.config/focus/stats.jsonl`. It also answers with the hosts the hosts file blocks while on, so the extension can count failed loads of those sites. If focus can't save them, the extension keeps up to 1,000 and tries again.
 - **Broken settings:** if `subreddits.json` can't be read, focus answers with an empty list; if `feeds.json` can't be read, it blocks every feed. Either way the blocked page says why, and `focus off` still turns blocking off.
 - **Incognito:** the extension's own pages can't open in Incognito windows, so a blocked page there shows Chrome's "blocked" error page instead, sometimes for the site's home page rather than the link itself.
 

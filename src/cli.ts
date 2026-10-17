@@ -53,6 +53,7 @@ import {
   writeAllowlist,
 } from "./subreddits.ts";
 import { FEED_SITES, type FeedSite, type FeedSiteId, defaultFeedsPath, findFeedSite, readFeeds, writeFeeds } from "./feeds.ts";
+import { type BlockingState, type StateEvent, appendEvents, defaultStatsPath, formatSummary, lastState, readEvents, summarize } from "./stats.ts";
 import { SPINNER, fileUrl, hyperlink, styles, supportsHyperlinks } from "./terminal.ts";
 import { UpgradeError, type UpgradeProgress, type UpgradeResult, upgrade } from "./upgrade.ts";
 import { VERSION } from "./version.ts";
@@ -71,6 +72,8 @@ Commands:
   on                      Turn blocking on for everything listed
   off                     Turn blocking off but keep the list
   status                  Show whether blocking is on and what's listed
+  stats                   How long focus was on each day, and how often Chrome tried to open a
+                          blocked site (--days <n>, default 7)
   sync                    Update presets to this version's hostnames
   feeds add <site...>     In Chrome, block only the feed of these sites, not all of them: ${FEED_SITES.map((site) => site.id).join(", ")}
   feeds remove <site...>  Stop blocking their feeds
@@ -93,6 +96,7 @@ Options:
       --hosts-file <path> Hosts file to manage (default: $FOCUS_HOSTS_FILE or /etc/hosts)
       --[no-]flush       Flush the macOS DNS cache after writing (default: true)
       --remove           setup-sudo: remove the rule instead of installing it
+      --days <n>         stats: how many days to show (default: 7)
   -h, --help             Show this help
   -v, --version          Print the version
 
@@ -138,6 +142,9 @@ export interface Io {
   sudoers: SudoersDeps;
   /** Paths for the subreddit allowlist and the Chrome extension. */
   chrome: ChromeDeps;
+  /** The stats file: when focus was on, and the blocked pages the extension reported. Written only as the user. */
+  statsPath: string;
+  now(): number;
   /** Chrome's pipe when it runs focus as the extension's native-messaging host. */
   nativeMessaging: {
     input(): AsyncIterable<Uint8Array>;
@@ -155,6 +162,9 @@ export type Key = "enter" | "skip" | "interrupt";
 export async function run(argv: string[], io: Io): Promise<number> {
   // Chrome runs the native-messaging host with the calling extension's origin as its only argument.
   if (argv[0]?.startsWith("chrome-extension://")) return runNativeHost(io);
+  // Stats are about the real hosts file, and kept as the user: root never writes them.
+  const before = io.isRoot ? null : await blockingState(io);
+  if (before) await recordState(before, io, { seen: true });
   try {
     return await runCommand(argv, io);
   } catch (error) {
@@ -165,7 +175,41 @@ export async function run(argv: string[], io: Io): Promise<number> {
     if (error instanceof Interrupted) return 130;
     io.stderr(`focus: ${describeError(error)}\n`);
     return 1;
+  } finally {
+    // Through sudo, the change is made by a child process; this one sees the result.
+    const after = before && (await blockingState(io));
+    if (after && after !== before) await recordState(after, io, { seen: false });
   }
+}
+
+/** Whether the system hosts file blocks right now, for stats; null if it can't be read or parsed. */
+async function blockingState(io: Io): Promise<BlockingState | null> {
+  try {
+    return readSection((await readHostsFile(io.systemHostsFile)).content)?.state === "on" ? "on" : "off";
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Logs a change of state. With `seen`, only if it differs from the last one logged: the
+ * change was made elsewhere (as root, or by hand) and focus only noticed it now. Stats
+ * never get in the way of a command, so a failure to write them is ignored.
+ */
+async function recordState(state: BlockingState, io: Io, { seen }: { seen: boolean }): Promise<void> {
+  try {
+    // Nothing logged yet counts as off, so the first note is only ever that focus is on.
+    if (seen && (lastState(await readEvents(io.statsPath)) ?? "off") === state) return;
+    const event: StateEvent = { at: new Date(io.now()).toISOString(), event: state, ...(seen ? { seen: true as const } : {}) };
+    await appendEvents(io.statsPath, [event]);
+  } catch {}
+}
+
+async function stats(args: string[], days: number, io: Io): Promise<number> {
+  if (args.length > 0) throw new UsageError("stats takes no arguments");
+  const summary = summarize(await readEvents(io.statsPath), io.now(), days);
+  io.stdout(formatSummary(summary, { inChrome: await isDirectory(io.chrome.extensionDir) }));
+  return 0;
 }
 
 async function runCommand(argv: string[], io: Io): Promise<number> {
@@ -183,6 +227,7 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
         "keep-empty": { type: "boolean" },
         // Internal: `config` runs hosts changes with this and prints one summary of its own.
         quiet: { type: "boolean" },
+        days: { type: "string" },
         flush: { type: "boolean" },
         help: { type: "boolean", short: "h" },
         preset: { type: "boolean" },
@@ -246,6 +291,14 @@ async function runCommand(argv: string[], io: Io): Promise<number> {
     return setupSudo(argv, { remove: values.remove ?? false, dryRun: values["dry-run"] ?? false }, io);
   }
   if (values.remove) throw new UsageError("--remove only works with setup-sudo");
+  if (values.days !== undefined && command !== "stats") throw new UsageError("--days only works with stats");
+  if (command === "stats") {
+    // The stats file is the user's, like the allowlist; under sudo, ~ would be root's.
+    if (io.isRoot) throw new UsageError("run `focus stats` as yourself, not with sudo");
+    const days = values.days === undefined ? 7 : Number(values.days);
+    if (!Number.isInteger(days) || days < 1 || days > 366) throw new UsageError("--days takes a number of days from 1 to 366");
+    return stats(args, days, io);
+  }
 
   const hostsPath = values["hosts-file"] ?? io.env.FOCUS_HOSTS_FILE ?? io.systemHostsFile;
   const targetsSystemHosts = await isSameFile(hostsPath, io.systemHostsFile);
@@ -1096,6 +1149,8 @@ async function runNativeHost(io: Io): Promise<number> {
       feedsPath: io.chrome.feedsPath,
       extensionSource: io.chrome.extensionSource,
       extensionDir: io.chrome.extensionDir,
+      statsPath: io.statsPath,
+      now: io.now,
       version: VERSION,
       log: io.stderr,
     });
@@ -1500,6 +1555,8 @@ if (import.meta.main) {
       openInChrome: async (url) => (await Bun.$`open -a ${"Google Chrome"} ${url}`.quiet().nothrow()).exitCode === 0,
       copyToClipboard: async (text) => (await Bun.$`printf %s ${text} | pbcopy`.quiet().nothrow()).exitCode === 0,
     },
+    statsPath: defaultStatsPath(),
+    now: () => Date.now(),
     nativeMessaging: {
       input: () => Bun.stdin.stream(),
       output: async (bytes) => void (await Bun.write(Bun.stdout, bytes)),
