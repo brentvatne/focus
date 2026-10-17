@@ -117,15 +117,16 @@ focus add -n twitter.com
 | `youtube` | yes | youtube.com, www.youtube.com, m.youtube.com, youtu.be |
 | `reddit` | yes | reddit.com, www.reddit.com, old.reddit.com, new.reddit.com, m.reddit.com, redd.it |
 | `instagram` | no | instagram.com, www.instagram.com |
-| `tiktok` | no | tiktok.com, www.tiktok.com, m.tiktok.com |
 | `linkedin` | no | linkedin.com, www.linkedin.com |
 | `hackernews` | no | news.ycombinator.com |
+| `nhl` | no | nhl.com, www.nhl.com, m.nhl.com, records.nhl.com |
 | `messenger` | no | messenger.com, www.messenger.com |
 
-- **Messenger is separate from Facebook,** so you can block Facebook and still use messenger.com. Shared CDNs such as `fbcdn.net`, `ytimg.com` and `googlevideo.com` are never blocked, which keeps embeds and Messenger's assets loading. `music.youtube.com` also stays reachable.
+- **Messenger is separate from Facebook,** so you can block Facebook and still use messenger.com. Shared CDNs such as `fbcdn.net`, `ytimg.com` and `googlevideo.com` are never blocked, which keeps embeds and Messenger's assets loading. `music.youtube.com` also stays reachable, and so does the NHL's scores API (`api-web.nhle.com`), which other apps and widgets use.
+- **TikTok was a preset until 0.5.1.** If you had it on, upgrading keeps blocking its hostnames as your own sites (`tiktok.com` and `m.tiktok.com` rows in `focus config`). To unblock it, set those rows to off, or run `focus remove tiktok.com m.tiktok.com`.
 - **Presets add exact hostnames.** The `www.` expansion and `exact` don't apply to them.
 - **Presets follow new versions.** focus records which presets you chose (`# preset: <name>` in the hosts file) rather than just copying their hostnames. Whenever it writes the file, it rebuilds each preset from the running version's list. So when a preset gains a hostname, as X did with `api.x.com`, you get it after `focus upgrade` or any other change. Hostnames a preset drops are removed the same way. Sites you added yourself are never touched.
-- **One preset at a time:** `focus add instagram` and `focus remove instagram` turn a single preset on or off, and can be mixed with hostnames (`focus add tiktok example.com`). Hostnames always contain a dot, so a single word is always read as a preset. A word that isn't one is an error, with a suggestion when it looks like a typo or another name for one (`youtub` → `youtube`, `twitter` → `x`); nothing is changed.
+- **One preset at a time:** `focus add instagram` and `focus remove instagram` turn a single preset on or off, and can be mixed with hostnames (`focus add nhl example.com`). Hostnames always contain a dot, so a single word is always read as a preset. A word that isn't one is an error, with a suggestion when it looks like a typo or another name for one (`youtub` → `youtube`, `twitter` → `x`); nothing is changed.
 - **One preset is all or nothing.** `focus remove api.x.com` refuses and points you to `focus remove x`. Adding a hostname that a preset already covers is a no-op.
 - **Without a prompt:** `focus init x youtube` sets your presets to exactly the named ones, and `focus init --yes` keeps the current ones (or picks the recommended ones on a fresh install). Use one of these in scripts; `init` with neither, and `config`, stop with an error when there's no terminal.
 - **Upgrading from 0.1.0:** 0.1.0 didn't record presets. The first time a newer version writes the file, any preset whose 0.1.0 hostnames are all present is recorded as that preset; everything else is kept as your own sites.

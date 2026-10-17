@@ -1474,9 +1474,9 @@ describe("reddit", () => {
       "YouTube: off / whole site / feed only",
       "Reddit: off / whole site / chosen subreddits",
       "Instagram: off / whole site / messages only",
-      "TikTok: off / whole site",
       "LinkedIn: off / whole site",
       "Hacker News: off / whole site",
+      "NHL: off / whole site",
       "Messenger: off / whole site",
       "example.com: off / blocked",
     ]);

@@ -12,7 +12,8 @@ export interface Preset {
 
 // /etc/hosts has no wildcards, so each preset lists the hostnames people actually
 // land on. Shared CDNs (fbcdn.net, ytimg.com, googlevideo.com, redditmedia.com)
-// are left alone so embeds and other apps that use them keep working.
+// are left alone so embeds and other apps that use them keep working, and so is the
+// NHL's scores API (api-web.nhle.com), which other apps and widgets use too.
 export const PRESETS: Preset[] = [
   {
     id: "x",
@@ -58,12 +59,6 @@ export const PRESETS: Preset[] = [
     recommended: false,
   },
   {
-    id: "tiktok",
-    name: "TikTok",
-    hosts: ["tiktok.com", "www.tiktok.com", "m.tiktok.com"],
-    recommended: false,
-  },
-  {
     id: "linkedin",
     name: "LinkedIn",
     hosts: ["linkedin.com", "www.linkedin.com"],
@@ -74,6 +69,13 @@ export const PRESETS: Preset[] = [
     name: "Hacker News",
     hosts: ["news.ycombinator.com"],
     recommended: false,
+  },
+  {
+    id: "nhl",
+    name: "NHL",
+    hosts: ["nhl.com", "www.nhl.com", "m.nhl.com", "records.nhl.com"],
+    recommended: false,
+    note: "scores in other apps keep working",
   },
   {
     id: "messenger",
